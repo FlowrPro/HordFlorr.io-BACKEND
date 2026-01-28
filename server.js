@@ -6,7 +6,11 @@ const http = require('http');
 const WebSocket = require('ws');
 const PORT = process.env.PORT || 8080;
 
-const MAP_RADIUS = 750;
+// --- World / tick ---
+const MAP_HALF = 3000;             // half-size of square map (linear ×4 from 750 -> 3000)
+const MAP_SIZE = MAP_HALF * 2;     // full side
+const MAP_TYPE = 'square';
+
 const TICK_RATE = 20;
 const TICK_DT = 1 / TICK_RATE;
 
@@ -19,9 +23,10 @@ const players = new Map();
 
 function randRange(min, max) { return Math.random() * (max - min) + min; }
 function spawnPosition() {
-  const r = MAP_RADIUS * 0.5 * Math.sqrt(Math.random());
-  const a = Math.random() * Math.PI * 2;
-  return { x: Math.cos(a) * r, y: Math.sin(a) * r };
+  // spawn uniformly inside square [-MAP_HALF, MAP_HALF]
+  const x = randRange(-MAP_HALF, MAP_HALF);
+  const y = randRange(-MAP_HALF, MAP_HALF);
+  return { x, y };
 }
 
 function createPlayer(ws) {
@@ -39,7 +44,6 @@ function createPlayer(ws) {
     ws,
     lastInput: { x: 0, y: 0 },
     lastSeen: Date.now(),
-    // chat timestamps for rate limiting (array of ms timestamps)
     chatTimestamps: []
   };
   players.set(id, p);
@@ -86,14 +90,14 @@ function serverTick() {
     p.x += vx * TICK_DT;
     p.y += vy * TICK_DT;
     p.vx = vx; p.vy = vy;
-    const dx = p.x - 0; const dy = p.y - 0;
-    const dist = Math.hypot(dx, dy);
-    const limit = MAP_RADIUS - p.radius - 1;
-    if (dist > limit) {
-      const k = limit / dist;
-      p.x = dx * k;
-      p.y = dy * k;
-    }
+
+    // clamp to square bounds around 0
+    const limit = MAP_HALF - p.radius - 1;
+    if (p.x > limit) p.x = limit;
+    if (p.x < -limit) p.x = -limit;
+    if (p.y > limit) p.y = limit;
+    if (p.y < -limit) p.y = -limit;
+
     p.lastSeen = Date.now();
   }
   broadcastSnapshot();
@@ -113,7 +117,9 @@ wss.on('connection', (ws, req) => {
   ws.send(JSON.stringify({
     t: 'welcome',
     id: player.id,
-    mapRadius: MAP_RADIUS,
+    mapHalf: MAP_HALF,
+    mapSize: MAP_SIZE,
+    mapType: MAP_TYPE,
     tickRate: TICK_RATE
   }));
 
