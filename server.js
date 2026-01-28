@@ -1,4 +1,4 @@
-// Minimal authoritative game server for Moborr.io (with chat broadcast).
+// Minimal authoritative game server for Moborr.io (with chat broadcast + rate-limiting).
 // Uses 'ws' WebSocket library. Run with: node server.js
 // Listens on process.env.PORT (Render provides this) or 8080 locally.
 
@@ -9,6 +9,10 @@ const PORT = process.env.PORT || 8080;
 const MAP_RADIUS = 750;
 const TICK_RATE = 20;
 const TICK_DT = 1 / TICK_RATE;
+
+// Chat rate limit: max N messages per WINDOW_MS per player
+const CHAT_MAX_PER_WINDOW = 5;
+const CHAT_WINDOW_MS = 1000; // 1 second
 
 let nextPlayerId = 1;
 const players = new Map();
@@ -34,7 +38,9 @@ function createPlayer(ws) {
     color,
     ws,
     lastInput: { x: 0, y: 0 },
-    lastSeen: Date.now()
+    lastSeen: Date.now(),
+    // chat timestamps for rate limiting (array of ms timestamps)
+    chatTimestamps: []
   };
   players.set(id, p);
   return p;
@@ -48,7 +54,7 @@ function broadcast(data) {
   const msg = JSON.stringify(data);
   for (const p of players.values()) {
     if (p.ws && p.ws.readyState === WebSocket.OPEN) {
-      p.ws.send(msg);
+      try { p.ws.send(msg); } catch (e) { /* ignore send errors */ }
     }
   }
 }
@@ -74,7 +80,7 @@ function broadcastSnapshot() {
 function serverTick() {
   for (const p of players.values()) {
     const inVec = p.lastInput || { x: 0, y: 0 };
-    const speed = 380;
+    const speed = 380; // keep current speed clamp
     const vx = inVec.x * speed;
     const vy = inVec.y * speed;
     p.x += vx * TICK_DT;
@@ -115,6 +121,7 @@ wss.on('connection', (ws, req) => {
     try {
       const msg = JSON.parse(data);
       if (!msg || !msg.t) return;
+
       if (msg.t === 'join') {
         const name = (msg.name && String(msg.name).slice(0, 24)) || player.name;
         player.name = name;
@@ -122,21 +129,47 @@ wss.on('connection', (ws, req) => {
       } else if (msg.t === 'input') {
         const input = msg.input;
         if (input && typeof input.x === 'number' && typeof input.y === 'number') {
-          const len = Math.hypot(input.x, input.y);
+          // sanitize numbers and clamp to [-1,1]
+          let x = Number(input.x);
+          let y = Number(input.y);
+          if (!isFinite(x) || !isFinite(y)) { player.lastInput = { x: 0, y: 0 }; return; }
+          x = Math.max(-1, Math.min(1, x));
+          y = Math.max(-1, Math.min(1, y));
+          // normalize vector to max length 1
+          const len = Math.hypot(x, y);
           if (len > 1e-6) {
-            player.lastInput = { x: input.x / Math.max(len,1), y: input.y / Math.max(len,1) };
+            const inv = 1 / Math.max(len, 1);
+            player.lastInput = { x: x * inv, y: y * inv };
           } else {
             player.lastInput = { x: 0, y: 0 };
           }
         }
       } else if (msg.t === 'chat') {
-        const text = String(msg.text || '').slice(0, 240);
+        // rate limiting: sliding window of CHAT_WINDOW_MS, max CHAT_MAX_PER_WINDOW
+        const now = Date.now();
+        player.chatTimestamps = (player.chatTimestamps || []).filter(ts => now - ts < CHAT_WINDOW_MS);
+        if (player.chatTimestamps.length >= CHAT_MAX_PER_WINDOW) {
+          // notify sender that message was blocked by rate limit
+          try {
+            ws.send(JSON.stringify({ t: 'chat_blocked', reason: 'rate_limit', ts: now }));
+          } catch (e) { /* ignore */ }
+          return;
+        }
+        player.chatTimestamps.push(now);
+
+        // sanitize text: remove newlines, clamp length
+        let text = String(msg.text || '');
+        text = text.replace(/[\r\n]+/g, ' ').slice(0, 240);
+
         const chat = {
           t: 'chat',
           name: player.name,
           text,
-          ts: Date.now()
+          ts: now
         };
+        // include chatId if provided, so clients can correlate and dedupe
+        if (msg.chatId) chat.chatId = msg.chatId;
+
         broadcast(chat);
       } else if (msg.t === 'ping') {
         ws.send(JSON.stringify({ t: 'pong', ts: msg.ts || Date.now() }));
