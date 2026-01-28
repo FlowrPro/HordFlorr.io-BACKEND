@@ -18,14 +18,18 @@ const TICK_DT = 1 / TICK_RATE;
 const CHAT_MAX_PER_WINDOW = 2;
 const CHAT_WINDOW_MS = 1000; // 1 second
 
+// Fixed spawn: bottom-left inside the square
+const SPAWN_MARGIN = 60; // distance from edges
+// note: player.radius is 28 in code; we leave margin enough to avoid clipping
+
 let nextPlayerId = 1;
 const players = new Map();
 
 function randRange(min, max) { return Math.random() * (max - min) + min; }
+// spawnPosition is now fixed bottom-left for everyone
 function spawnPosition() {
-  // spawn uniformly inside square [-MAP_HALF, MAP_HALF]
-  const x = randRange(-MAP_HALF, MAP_HALF);
-  const y = randRange(-MAP_HALF, MAP_HALF);
+  const x = -MAP_HALF + SPAWN_MARGIN;
+  const y = MAP_HALF - SPAWN_MARGIN;
   return { x, y };
 }
 
@@ -114,13 +118,16 @@ wss.on('connection', (ws, req) => {
   console.log('connection from', req.socket.remoteAddress);
   const player = createPlayer(ws);
 
+  // Send welcome including authoritative spawn so client can position immediately
   ws.send(JSON.stringify({
     t: 'welcome',
     id: player.id,
     mapHalf: MAP_HALF,
     mapSize: MAP_SIZE,
     mapType: MAP_TYPE,
-    tickRate: TICK_RATE
+    tickRate: TICK_RATE,
+    spawnX: player.x,
+    spawnY: player.y
   }));
 
   ws.on('message', (data) => {
