@@ -11,7 +11,7 @@ const TICK_RATE = 20;
 const TICK_DT = 1 / TICK_RATE;
 
 // Chat rate limit: max N messages per WINDOW_MS per player
-const CHAT_MAX_PER_WINDOW = 5;
+const CHAT_MAX_PER_WINDOW = 2;
 const CHAT_WINDOW_MS = 1000; // 1 second
 
 let nextPlayerId = 1;
