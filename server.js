@@ -1,4 +1,4 @@
-// Minimal authoritative game server for Moborr.io (with chat broadcast + rate-limiting + static walls).
+// Minimal authoritative game server for Moborr.io (with chat broadcast + rate-limiting + static walls + mobs).
 // Uses 'ws' WebSocket library. Run with: node server_Version8.js
 // Listens on process.env.PORT (Render provides this) or 8080 locally.
 
@@ -37,7 +37,6 @@ const GAP = 40; // small inset so walls don't lie exactly on cell boundaries (av
 
 // Create rectangles using grid coordinates (col,row are 1-based)
 function h(col, row, lenCells, id) {
-  // horizontal wall: length spans lenCells * CELL, thickness is WALL_THICKNESS (height)
   return {
     id: id || `h_${col}_${row}_${lenCells}`,
     x: -MAP_HALF + (col - 1) * CELL + GAP,
@@ -47,7 +46,6 @@ function h(col, row, lenCells, id) {
   };
 }
 function v(col, row, lenCells, id) {
-  // vertical wall: length spans lenCells * CELL, thickness is WALL_THICKNESS (width)
   return {
     id: id || `v_${col}_${row}_${lenCells}`,
     x: -MAP_HALF + (col - 1) * CELL + GAP,
@@ -67,42 +65,79 @@ function box(col, row, wCells, hCells, id) {
 }
 
 // --- Walls: Option I (Mixed Islands + Dense Edge Pockets) scaled to 12000x12000
-// We keep WALL_THICKNESS the same and scale positions using the 12x12 grid.
-// Outer border walls are intentionally NOT included (so map edges are open).
 const walls = [
-  // Top edge pockets (left and right)
   h(1, 1, 2, 'top_pocket_left'),
   h(10, 1, 3, 'top_pocket_right'),
-
-  // Top inner islands / small pockets
   box(3, 3, 1, 1, 'island_top_left'),
   box(6, 2, 1, 1, 'island_top_center'),
   box(8, 3, 1, 1, 'island_top_right'),
-
-  // Left-side vertical features (pockets and corridors)
   v(1, 4, 3, 'left_inner_v1'),
   h(2, 5, 3, 'left_mid_h'),
-
-  // Center island cluster
   box(5, 5, 2, 2, 'center_island'),
-
-  // Bottom central islands (not blocking spawn)
   box(4, 9, 2, 1, 'bottom_mid_small'),
-
-  // Right side vertical building and inner boxes
   v(10, 2, 5, 'right_building_v'),
   box(8, 4, 1, 2, 'right_inner_box'),
-
-  // Several perimeter pocket segments along the bottom/right edges (but inset)
   h(2, 12, 2, 'bottom_pocket_left'),
   h(6, 12, 2, 'bottom_pocket_center'),
   v(12, 6, 3, 'right_pocket_vertical'),
-
-  // scattered inner islands to create more pockets (chaotic)
   box(3, 8, 1, 1, 'island_lower_left'),
   box(9, 7, 1, 1, 'island_mid_right'),
   box(7, 9, 1, 1, 'island_bottom_right')
 ];
+
+// --- Mob system ---
+// Definitions for mob types (can expand)
+const mobDefs = {
+  goblin: { name: 'Goblin', maxHp: 120, atk: 14, speed: 140, xp: 12, goldMin: 6, goldMax: 14, respawn: 12, radius: 22 },
+  wolf:   { name: 'Wolf',   maxHp: 180, atk: 20, speed: 170, xp: 20, goldMin: 12, goldMax: 20, respawn: 18, radius: 26 },
+  slime:  { name: 'Slime',  maxHp: 80,  atk: 8,  speed: 100, xp: 6,  goldMin: 2,  goldMax: 6,  respawn: 10, radius: 18 }
+};
+
+// spawn points (derived from islands/pockets) - use cell centers with offsets
+const mobSpawnPoints = [
+  { x: -MAP_HALF + CELL * 2 + CELL/2, y: -MAP_HALF + CELL*2 + CELL/2, types: ['goblin','slime'] },
+  { x: -MAP_HALF + CELL * 6 + CELL/2, y: -MAP_HALF + CELL*6 + CELL/2, types: ['wolf','goblin'] },
+  { x: -MAP_HALF + CELL * 10 + CELL/2, y: -MAP_HALF + CELL*3 + CELL/2, types: ['goblin','slime'] },
+  { x: -MAP_HALF + CELL * 3 + CELL/2, y: -MAP_HALF + CELL*9 + CELL/2, types: ['slime','goblin'] },
+  { x: -MAP_HALF + CELL * 9 + CELL/2, y: -MAP_HALF + CELL*8 + CELL/2, types: ['wolf','goblin'] },
+];
+
+// mob instances
+let mobs = new Map();
+let nextMobId = 1;
+
+function spawnMobAt(spawnPoint, typeName) {
+  const def = mobDefs[typeName];
+  if (!def) return null;
+  const jitter = 80;
+  const x = spawnPoint.x + (Math.random() * jitter * 2 - jitter);
+  const y = spawnPoint.y + (Math.random() * jitter * 2 - jitter);
+  const m = {
+    id: 'mob_' + (nextMobId++),
+    type: typeName,
+    x, y,
+    vx: 0, vy: 0,
+    hp: def.maxHp,
+    maxHp: def.maxHp,
+    radius: def.radius,
+    aggroRadius: 650,
+    lastHitBy: null, // track highest contributor
+    damageContrib: new Map(), // playerId => damage
+    spawnPoint,
+    def,
+    respawnAt: null
+  };
+  mobs.set(m.id, m);
+  return m;
+}
+
+// initial spawn: spawn 3 mobs per spawn point
+for (const sp of mobSpawnPoints) {
+  for (let i = 0; i < 3; i++) {
+    const type = sp.types[Math.floor(Math.random() * sp.types.length)];
+    spawnMobAt(sp, type);
+  }
+}
 
 // spawnPosition is fixed bottom-left for everyone (inside map, away from edge)
 function spawnPosition() {
@@ -126,7 +161,16 @@ function createPlayer(ws) {
     ws,
     lastInput: { x: 0, y: 0 },
     lastSeen: Date.now(),
-    chatTimestamps: []
+    chatTimestamps: [],
+    // combat/persistence fields (in-memory for now)
+    maxHp: 200,
+    hp: 200,
+    xp: 0,
+    gold: 0,
+    lastAttackTime: 0,
+    attackCooldown: 0.6, // seconds
+    baseDamage: 18,
+    invulnerableUntil: 0
   };
   players.set(id, p);
   return p;
@@ -146,21 +190,92 @@ function broadcast(data) {
 }
 
 function broadcastSnapshot() {
+  // players minimal info
+  const playerList = Array.from(players.values()).map(p => ({
+    id: p.id,
+    name: p.name,
+    x: Math.round(p.x),
+    y: Math.round(p.y),
+    vx: Math.round(p.vx),
+    vy: Math.round(p.vy),
+    radius: p.radius,
+    color: p.color,
+    hp: Math.round(p.hp),
+    maxHp: Math.round(p.maxHp)
+  }));
+
+  const mobsList = Array.from(mobs.values()).map(m => ({
+    id: m.id,
+    type: m.type,
+    x: Math.round(m.x),
+    y: Math.round(m.y),
+    hp: Math.round(m.hp),
+    maxHp: Math.round(m.maxHp),
+    radius: m.radius
+  }));
+
   const snapshot = {
     t: 'snapshot',
     tick: Date.now(),
-    players: Array.from(players.values()).map(p => ({
-      id: p.id,
-      name: p.name,
-      x: Math.round(p.x),
-      y: Math.round(p.y),
-      vx: Math.round(p.vx),
-      vy: Math.round(p.vy),
-      radius: p.radius,
-      color: p.color
-    }))
+    players: playerList,
+    mobs: mobsList
   };
   broadcast(snapshot);
+}
+
+// simple distance
+function dist(a,b) {
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  return Math.hypot(dx,dy);
+}
+
+// apply damage to mob, track contribution
+function damageMob(mob, amount, playerId) {
+  mob.hp -= amount;
+  if (playerId) {
+    const prev = mob.damageContrib.get(playerId) || 0;
+    mob.damageContrib.set(playerId, prev + amount);
+    mob.lastHitBy = playerId;
+  }
+  if (mob.hp <= 0) {
+    handleMobDeath(mob);
+  }
+}
+
+function handleMobDeath(mob) {
+  // determine highest contributor
+  let topId = null;
+  let topDmg = 0;
+  for (const [pid, dmg] of mob.damageContrib.entries()) {
+    if (dmg > topDmg) { topDmg = dmg; topId = pid; }
+  }
+  const def = mob.def;
+  const now = Date.now();
+  // pick gold reward and xp
+  const gold = Math.round(randRange(def.goldMin, def.goldMax));
+  const xp = def.xp;
+
+  // award top contributor (if exists)
+  if (topId && players.has(topId)) {
+    const killer = players.get(topId);
+    killer.gold += gold;
+    killer.xp += xp;
+    // notify killer via mob_died message
+    const msg = { t: 'mob_died', mobId: mob.id, mobType: mob.type, killerId: topId, gold, xp };
+    broadcast(msg);
+  } else {
+    // no killer (mob died to environment?) broadcast anyway
+    const msg = { t: 'mob_died', mobId: mob.id, mobType: mob.type, killerId: null, gold: 0, xp: 0 };
+    broadcast(msg);
+  }
+
+  // schedule respawn
+  mob.respawnAt = now + def.respawn * 1000;
+  // mark dead by moving off-map or setting hp=0 and will be skipped until respawn
+  mob.hp = 0;
+  mob.damageContrib.clear();
+  mob.lastHitBy = null;
 }
 
 // Collision: circle (player) vs AABB (rect)
@@ -218,33 +333,132 @@ function resolveCircleAABB(p, rect) {
 }
 
 function serverTick() {
+  // handle mob AI + respawns
+  const now = Date.now();
+  // respawn mobs
+  for (const m of mobs.values()) {
+    if (m.hp <= 0 && m.respawnAt && now >= m.respawnAt) {
+      // respawn fresh mob at spawnPoint
+      mobs.delete(m.id); // remove dead placeholder
+      const sp = m.spawnPoint;
+      const newMob = spawnMobAt(sp, m.type);
+      continue;
+    }
+  }
+
+  // update mobs
+  for (const mob of mobs.values()) {
+    // find nearest player within aggroRadius
+    let target = null;
+    let bestDist = Infinity;
+    for (const p of players.values()) {
+      const d = Math.hypot(mob.x - p.x, mob.y - p.y);
+      if (d < mob.aggroRadius && d < bestDist && p.hp > 0) {
+        bestDist = d;
+        target = p;
+      }
+    }
+
+    if (target) {
+      // move toward target
+      const dx = target.x - mob.x;
+      const dy = target.y - mob.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const speed = mob.def.speed;
+      mob.vx = (dx / len) * speed;
+      mob.vy = (dy / len) * speed;
+      mob.x += mob.vx * TICK_DT;
+      mob.y += mob.vy * TICK_DT;
+
+      // attack if close
+      const minDist = mob.radius + target.radius + 6;
+      if (Math.hypot(mob.x - target.x, mob.y - target.y) <= minDist) {
+        // mob deals damage to player
+        const dmg = mob.def.atk * TICK_DT * 0.8; // scaled per tick
+        // don't damage invulnerable players (respawn protection)
+        if (Date.now() >= (target.invulnerableUntil || 0)) {
+          target.hp -= dmg;
+          if (target.hp <= 0) {
+            handlePlayerDeath(target, mob);
+          }
+        }
+      }
+    } else {
+      // idle / small random walk
+      mob.vx *= 0.9;
+      mob.vy *= 0.9;
+      mob.x += mob.vx * TICK_DT;
+      mob.y += mob.vy * TICK_DT;
+    }
+  }
+
+  // handle player movement & auto-attacks, collisions & respawn
   for (const p of players.values()) {
     const inVec = p.lastInput || { x: 0, y: 0 };
-    const speed = 380; // keep current speed clamp
+    const speed = 380;
     const vx = inVec.x * speed;
     const vy = inVec.y * speed;
     p.x += vx * TICK_DT;
     p.y += vy * TICK_DT;
     p.vx = vx; p.vy = vy;
 
-    // clamp to square bounds around 0
+    // clamp to square bounds
     const limit = MAP_HALF - p.radius - 1;
     if (p.x > limit) p.x = limit;
     if (p.x < -limit) p.x = -limit;
     if (p.y > limit) p.y = limit;
     if (p.y < -limit) p.y = -limit;
 
-    // resolve collisions with walls
+    // local collisions with walls
     for (const w of walls) resolveCircleAABB(p, w);
 
+    // auto-attack mobs if in range & cooldown
+    const nowSec = Date.now() / 1000;
+    if (p.hp > 0) {
+      for (const mob of mobs.values()) {
+        if (mob.hp <= 0) continue;
+        const d = Math.hypot(mob.x - p.x, mob.y - p.y);
+        const attackRange = p.radius + mob.radius + 8;
+        if (d <= attackRange) {
+          if (nowSec - (p.lastAttackTime || 0) >= p.attackCooldown) {
+            p.lastAttackTime = nowSec;
+            const dmg = p.baseDamage;
+            damageMob(mob, dmg, p.id);
+          }
+        }
+      }
+    } else {
+      // if dead, respawn immediately (quick respawn) - give short invulnerability
+      // We respawn only once (hp <= 0)
+      const pos = spawnPosition();
+      p.x = pos.x; p.y = pos.y;
+      p.hp = p.maxHp;
+      p.invulnerableUntil = Date.now() + 3000; // 3s respawn invulnerability
+    }
     p.lastSeen = Date.now();
   }
+
+  // send snapshots
   broadcastSnapshot();
 }
 
+function handlePlayerDeath(player, killerMobOrPlayer) {
+  // for now, on death we don't drop persistent items; respawn handled in serverTick loop
+  // If we later implement PvP kills, transfer 5% gold to killer
+  // placeholder for PvP gold transfer if killer is a player object
+  // player.hp = 0; respawn handled in serverTick (quick respawn)
+  player.hp = 0;
+}
+
+// HTTP server for a basic status route
 const server = http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end('Moborr.io server running\n');
+  if (req.method === 'GET' && req.url === '/') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Moborr.io server running\n');
+    return;
+  }
+  res.writeHead(404);
+  res.end();
 });
 
 const wss = new WebSocket.Server({ server });
@@ -253,7 +467,7 @@ wss.on('connection', (ws, req) => {
   console.log('connection from', req.socket.remoteAddress);
   const player = createPlayer(ws);
 
-  // Send welcome including authoritative spawn and walls
+  // Send welcome including authoritative spawn and walls + basic player info
   ws.send(JSON.stringify({
     t: 'welcome',
     id: player.id,
