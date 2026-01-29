@@ -1,4 +1,4 @@
-// Minimal authoritative game server for Moborr.io (with chat broadcast + rate-limiting).
+// Minimal authoritative game server for Moborr.io (with chat broadcast + rate-limiting + static walls).
 // Uses 'ws' WebSocket library. Run with: node server.js
 // Listens on process.env.PORT (Render provides this) or 8080 locally.
 
@@ -18,15 +18,55 @@ const TICK_DT = 1 / TICK_RATE;
 const CHAT_MAX_PER_WINDOW = 2;
 const CHAT_WINDOW_MS = 1000; // 1 second
 
+// Wall thickness (8 × player diameter). Player radius = 28 -> diameter = 56 -> thickness = 448
+const WALL_THICKNESS = 448;
+
 // Fixed spawn: bottom-left inside the square
 const SPAWN_MARGIN = 60; // distance from edges
-// note: player.radius is 28 in code; we leave margin enough to avoid clipping
+
+// --- Static walls (mapped from sketch using 12x12 grid, cell = 500) ---
+// Format: { id, x, y, w, h } where x,y are top-left in world coords.
+const walls = [
+  // outer border (4)
+  { id: 'border_top',    x: -MAP_HALF, y: -MAP_HALF, w: MAP_SIZE, h: WALL_THICKNESS },
+  { id: 'border_bottom', x: -MAP_HALF, y: MAP_HALF - WALL_THICKNESS, w: MAP_SIZE, h: WALL_THICKNESS },
+  { id: 'border_left',   x: -MAP_HALF, y: -MAP_HALF, w: WALL_THICKNESS, h: MAP_SIZE },
+  { id: 'border_right',  x: MAP_HALF - WALL_THICKNESS, y: -MAP_HALF, w: WALL_THICKNESS, h: MAP_SIZE },
+
+  // inner features approximated from your sketch (aligned to 12x12 grid, cell=500)
+  // helper constants used to compute coordinates for clarity
+  // Left large vertical (~column 1 spanning rows 1..10)
+  { id: 'left_big_v', x: -2474, y: -2474, w: WALL_THICKNESS, h: 5000 },
+
+  // Top inner horizontal (columns 2..9 at row 1)
+  { id: 'inner_top_h', x: -1974, y: -2474, w: 4000, h: WALL_THICKNESS },
+
+  // Left inner small horizontal near middle (columns 1..3, row 5)
+  { id: 'left_mid_h', x: -2474, y: -474, w: 1500, h: WALL_THICKNESS },
+
+  // Left inner vertical (column 3 spanning rows 2..6)
+  { id: 'left_inner_v', x: -1474, y: -1974, w: WALL_THICKNESS, h: 2500 },
+
+  // Center box (columns 5..6 rows 3..5)
+  { id: 'center_box', x: -474, y: -1474, w: 1000, h: 1500 },
+
+  // Right vertical building (column 9 rows 2..8)
+  { id: 'right_building_v', x: 1526, y: -1974, w: WALL_THICKNESS, h: 3500 },
+
+  // Right inner small box (columns 7..8 rows 3..5)
+  { id: 'right_inner_box', x: 526, y: -1474, w: 1000, h: 1500 },
+
+  // Bottom central box (columns 4..6 row 9)
+  { id: 'bottom_box', x: -974, y: 1526, w: 1500, h: 500 }
+];
 
 let nextPlayerId = 1;
 const players = new Map();
 
+// Utility
 function randRange(min, max) { return Math.random() * (max - min) + min; }
-// spawnPosition is now fixed bottom-left for everyone
+
+// spawnPosition is fixed bottom-left for everyone
 function spawnPosition() {
   const x = -MAP_HALF + SPAWN_MARGIN;
   const y = MAP_HALF - SPAWN_MARGIN;
@@ -85,6 +125,65 @@ function broadcastSnapshot() {
   broadcast(snapshot);
 }
 
+// Collision: circle (player) vs AABB (rect)
+function resolveCircleAABB(p, rect) {
+  const rx1 = rect.x;
+  const ry1 = rect.y;
+  const rx2 = rect.x + rect.w;
+  const ry2 = rect.y + rect.h;
+
+  // closest point on AABB to circle center
+  const closestX = Math.max(rx1, Math.min(p.x, rx2));
+  const closestY = Math.max(ry1, Math.min(p.y, ry2));
+
+  let dx = p.x - closestX;
+  let dy = p.y - closestY;
+  const distSq = dx * dx + dy * dy;
+
+  if (distSq === 0) {
+    // circle center is exactly at a rectangle edge or inside; handle by pushing out along smallest penetration
+    // compute distances to rectangle edges
+    const leftDist = Math.abs(p.x - rx1);
+    const rightDist = Math.abs(rx2 - p.x);
+    const topDist = Math.abs(p.y - ry1);
+    const bottomDist = Math.abs(ry2 - p.y);
+    const minHoriz = Math.min(leftDist, rightDist);
+    const minVert = Math.min(topDist, bottomDist);
+    if (minHoriz < minVert) {
+      // push horizontally
+      if (leftDist < rightDist) {
+        p.x = rx1 - p.radius - 0.1;
+      } else {
+        p.x = rx2 + p.radius + 0.1;
+      }
+    } else {
+      // push vertically
+      if (topDist < bottomDist) {
+        p.y = ry1 - p.radius - 0.1;
+      } else {
+        p.y = ry2 + p.radius + 0.1;
+      }
+    }
+    p.vx = 0; p.vy = 0;
+    return;
+  }
+
+  const dist = Math.sqrt(distSq);
+  const overlap = p.radius - dist;
+  if (overlap > 0) {
+    // push the player out along the vector from closest point to center
+    dx /= dist; dy /= dist;
+    p.x += dx * overlap;
+    p.y += dy * overlap;
+    // zero-out velocities along collision normal for stability
+    const vn = p.vx * dx + p.vy * dy;
+    if (vn > 0) {
+      p.vx -= vn * dx;
+      p.vy -= vn * dy;
+    }
+  }
+}
+
 function serverTick() {
   for (const p of players.values()) {
     const inVec = p.lastInput || { x: 0, y: 0 };
@@ -102,6 +201,9 @@ function serverTick() {
     if (p.y > limit) p.y = limit;
     if (p.y < -limit) p.y = -limit;
 
+    // resolve collisions with walls
+    for (const w of walls) resolveCircleAABB(p, w);
+
     p.lastSeen = Date.now();
   }
   broadcastSnapshot();
@@ -118,7 +220,7 @@ wss.on('connection', (ws, req) => {
   console.log('connection from', req.socket.remoteAddress);
   const player = createPlayer(ws);
 
-  // Send welcome including authoritative spawn so client can position immediately
+  // Send welcome including authoritative spawn and walls
   ws.send(JSON.stringify({
     t: 'welcome',
     id: player.id,
@@ -127,7 +229,8 @@ wss.on('connection', (ws, req) => {
     mapType: MAP_TYPE,
     tickRate: TICK_RATE,
     spawnX: player.x,
-    spawnY: player.y
+    spawnY: player.y,
+    walls // include static walls (array)
   }));
 
   ws.on('message', (data) => {
