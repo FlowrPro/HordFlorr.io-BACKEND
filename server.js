@@ -1,5 +1,5 @@
 // Minimal authoritative game server for Moborr.io (with chat broadcast + rate-limiting + static walls).
-// Uses 'ws' WebSocket library. Run with: node server.js
+// Uses 'ws' WebSocket library. Run with: node server_Version8.js
 // Listens on process.env.PORT (Render provides this) or 8080 locally.
 
 const http = require('http');
@@ -7,8 +7,8 @@ const WebSocket = require('ws');
 const PORT = process.env.PORT || 8080;
 
 // --- World / tick ---
-const MAP_HALF = 3000;             // half-size of square map (linear ×4 from 750 -> 3000)
-const MAP_SIZE = MAP_HALF * 2;     // full side
+const MAP_HALF = 6000;             // half-size of square map (now 12000 full side)
+const MAP_SIZE = MAP_HALF * 2;     // full side = 12000
 const MAP_TYPE = 'square';
 
 const TICK_RATE = 20;
@@ -18,41 +18,12 @@ const TICK_DT = 1 / TICK_RATE;
 const CHAT_MAX_PER_WINDOW = 2;
 const CHAT_WINDOW_MS = 1000; // 1 second
 
-// Wall thickness (8 × player diameter). Player radius = 28 -> diameter = 56 -> thickness = 448
+// Wall thickness (keep the same thickness as before)
 const WALL_THICKNESS = 448;
 
-// Fixed spawn: bottom-left inside the square
-const SPAWN_MARGIN = 60; // distance from edges
-
-// --- Static walls (mapped from sketch using 12x12 grid, cell = 500) ---
-// Format: { id, x, y, w, h } where x,y are top-left in world coords.
-// Outer border walls intentionally REMOVED per request; only keep internal obstacles.
-const walls = [
-  // inner features approximated from your sketch (aligned to 12x12 grid, cell=500)
-  // Left large vertical (~column 1 spanning rows 1..10)
-  { id: 'left_big_v', x: -2474, y: -2474, w: WALL_THICKNESS, h: 5000 },
-
-  // Top inner horizontal (columns 2..9 at row 1)
-  { id: 'inner_top_h', x: -1974, y: -2474, w: 4000, h: WALL_THICKNESS },
-
-  // Left inner small horizontal near middle (columns 1..3, row 5)
-  { id: 'left_mid_h', x: -2474, y: -474, w: 1500, h: WALL_THICKNESS },
-
-  // Left inner vertical (column 3 spanning rows 2..6)
-  { id: 'left_inner_v', x: -1474, y: -1974, w: WALL_THICKNESS, h: 2500 },
-
-  // Center box (columns 5..6 rows 3..5)
-  { id: 'center_box', x: -474, y: -1474, w: 1000, h: 1500 },
-
-  // Right vertical building (column 9 rows 2..8)
-  { id: 'right_building_v', x: 1526, y: -1974, w: WALL_THICKNESS, h: 3500 },
-
-  // Right inner small box (columns 7..8 rows 3..5)
-  { id: 'right_inner_box', x: 526, y: -1474, w: 1000, h: 1500 },
-
-  // Bottom central box (columns 4..6 row 9)
-  { id: 'bottom_box', x: -974, y: 1526, w: 1500, h: 500 }
-];
+// Fixed spawn: bottom-left inside the square (kept bottom-left)
+// Small margin so spawn isn't exactly on the border
+const SPAWN_MARGIN = 300; // larger than before because the map is larger
 
 let nextPlayerId = 1;
 const players = new Map();
@@ -60,7 +31,80 @@ const players = new Map();
 // Utility
 function randRange(min, max) { return Math.random() * (max - min) + min; }
 
-// spawnPosition is fixed bottom-left for everyone
+// Helper: convert grid (12x12) -> world rectangles
+const CELL = MAP_SIZE / 12; // 1000 with MAP_SIZE=12000
+const GAP = 40; // small inset so walls don't lie exactly on cell boundaries (avoids tiny overlaps)
+
+// Create rectangles using grid coordinates (col,row are 1-based)
+function h(col, row, lenCells, id) {
+  // horizontal wall: length spans lenCells * CELL, thickness is WALL_THICKNESS (height)
+  return {
+    id: id || `h_${col}_${row}_${lenCells}`,
+    x: -MAP_HALF + (col - 1) * CELL + GAP,
+    y: -MAP_HALF + (row - 1) * CELL + GAP,
+    w: Math.max(1, lenCells) * CELL - GAP * 2,
+    h: WALL_THICKNESS
+  };
+}
+function v(col, row, lenCells, id) {
+  // vertical wall: length spans lenCells * CELL, thickness is WALL_THICKNESS (width)
+  return {
+    id: id || `v_${col}_${row}_${lenCells}`,
+    x: -MAP_HALF + (col - 1) * CELL + GAP,
+    y: -MAP_HALF + (row - 1) * CELL + GAP,
+    w: WALL_THICKNESS,
+    h: Math.max(1, lenCells) * CELL - GAP * 2
+  };
+}
+function box(col, row, wCells, hCells, id) {
+  return {
+    id: id || `box_${col}_${row}_${wCells}x${hCells}`,
+    x: -MAP_HALF + (col - 1) * CELL + GAP,
+    y: -MAP_HALF + (row - 1) * CELL + GAP,
+    w: Math.max(1, wCells) * CELL - GAP * 2,
+    h: Math.max(1, hCells) * CELL - GAP * 2
+  };
+}
+
+// --- Walls: Option I (Mixed Islands + Dense Edge Pockets) scaled to 12000x12000
+// We keep WALL_THICKNESS the same and scale positions using the 12x12 grid.
+// Outer border walls are intentionally NOT included (so map edges are open).
+const walls = [
+  // Top edge pockets (left and right)
+  h(1, 1, 2, 'top_pocket_left'),
+  h(10, 1, 3, 'top_pocket_right'),
+
+  // Top inner islands / small pockets
+  box(3, 3, 1, 1, 'island_top_left'),
+  box(6, 2, 1, 1, 'island_top_center'),
+  box(8, 3, 1, 1, 'island_top_right'),
+
+  // Left-side vertical features (pockets and corridors)
+  v(1, 4, 3, 'left_inner_v1'),
+  h(2, 5, 3, 'left_mid_h'),
+
+  // Center island cluster
+  box(5, 5, 2, 2, 'center_island'),
+
+  // Bottom central islands (not blocking spawn)
+  box(4, 9, 2, 1, 'bottom_mid_small'),
+
+  // Right side vertical building and inner boxes
+  v(10, 2, 5, 'right_building_v'),
+  box(8, 4, 1, 2, 'right_inner_box'),
+
+  // Several perimeter pocket segments along the bottom/right edges (but inset)
+  h(2, 12, 2, 'bottom_pocket_left'),
+  h(6, 12, 2, 'bottom_pocket_center'),
+  v(12, 6, 3, 'right_pocket_vertical'),
+
+  // scattered inner islands to create more pockets (chaotic)
+  box(3, 8, 1, 1, 'island_lower_left'),
+  box(9, 7, 1, 1, 'island_mid_right'),
+  box(7, 9, 1, 1, 'island_bottom_right')
+];
+
+// spawnPosition is fixed bottom-left for everyone (inside map, away from edge)
 function spawnPosition() {
   const x = -MAP_HALF + SPAWN_MARGIN;
   const y = MAP_HALF - SPAWN_MARGIN;
@@ -219,7 +263,7 @@ wss.on('connection', (ws, req) => {
     tickRate: TICK_RATE,
     spawnX: player.x,
     spawnY: player.y,
-    walls // include static walls (array) — no border walls
+    walls // include static walls (array) — interior pockets and islands, no border walls
   }));
 
   ws.on('message', (data) => {
