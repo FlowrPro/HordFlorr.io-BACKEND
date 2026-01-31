@@ -1,19 +1,14 @@
-// Minimal authoritative game server for Moborr.io (with chat broadcast + rate-limiting + static walls + mobs).
-// WebSocket auth: supports Google ID token verification (Google tokeninfo).
-// Run: node server_Version8_Version4.js
+// Minimal authoritative game server for Moborr.io (guest-only join, mobs and world simulation).
+// Run: node server.js
 // Environment:
 //  - PORT (optional)
-//  - GOOGLE_CLIENT_ID (recommended) — your Firebase Web OAuth Client ID (will be used to assert token audience).
 //
-// NOTE: This file DOES NOT include DB persistence. It accepts verified Google sign-in and creates runtime player
-// using Google UID as the player id. Later you can persist player data keyed by that UID.
+// NOTE: This server intentionally contains no registration/signup/auth code — it accepts guest joins only.
 
 const http = require('http');
-const https = require('https');
 const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 8080;
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '931063224197-qq95trua3q0gauq0jq6vom3829fojnme.apps.googleusercontent.com';
 
 // --- World / tick ---
 const MAP_HALF = 6000;
@@ -90,34 +85,10 @@ for (const sp of mobSpawnPoints) for (let i=0;i<3;i++) spawnMobAt(sp, sp.types[M
 function nowMs(){ return Date.now(); }
 function randRange(min,max){ return Math.random()*(max-min)+min; }
 
-// Verify Google ID token by calling Google's tokeninfo endpoint
-function verifyGoogleIdToken(idToken) {
-  return new Promise((resolve, reject) => {
-    const url = `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`;
-    https.get(url, (res) => {
-      let body = '';
-      res.on('data', chunk => body += chunk);
-      res.on('end', () => {
-        if (res.statusCode !== 200) {
-          return reject(new Error('Invalid ID token (status ' + res.statusCode + ')'));
-        }
-        try {
-          const payload = JSON.parse(body);
-          if (GOOGLE_CLIENT_ID && payload.aud && payload.aud !== GOOGLE_CLIENT_ID) {
-            return reject(new Error('Token audience mismatch'));
-          }
-          // payload contains sub (UID), email, name, aud, exp, iat...
-          resolve(payload);
-        } catch (err) { reject(err); }
-      });
-    }).on('error', (err) => reject(err));
-  });
-}
-
 // Spawn position
 function spawnPosition() { return { x: -MAP_HALF + SPAWN_MARGIN, y: MAP_HALF - SPAWN_MARGIN }; }
 
-// Create runtime player. If fixedId is provided, use that as player's id (Google UID).
+// Create runtime player. If fixedId is provided, use that as player's id.
 function createPlayerRuntime(ws, opts = {}) {
   const fixedId = opts.id || null;
   const id = fixedId ? String(fixedId) : String(nextPlayerId++);
@@ -265,7 +236,7 @@ function serverTick() {
 
 setInterval(serverTick, Math.round(1000 / TICK_RATE));
 
-// --- WebSocket auth + message handling (wait for auth message or 'join') ---
+// --- WebSocket handling (guest join only) ---
 wss.on('connection', (ws, req) => {
   console.log('connection from', req.socket.remoteAddress);
   ws.isAlive = true;
@@ -280,36 +251,15 @@ wss.on('connection', (ws, req) => {
       if (!msg || !msg.t) return;
 
       if (!ws.authenticated) {
-        // Accept either Google auth or a plain join (guest)
-        if (msg.t === 'auth' && msg.provider === 'google' && msg.idToken) {
-          try {
-            const payload = await verifyGoogleIdToken(String(msg.idToken));
-            const googleUid = payload.sub;
-            // If existing session for that UID, disconnect it
-            if (players.has(String(googleUid))) {
-              const prev = players.get(String(googleUid));
-              try { prev.ws.close(); } catch(e) {}
-              players.delete(String(googleUid));
-            }
-            const p = createPlayerRuntime(ws, { id: googleUid, name: payload.name || payload.email || ('Player' + googleUid) });
-            ws.authenticated = true; ws.playerId = p.id;
-            ws.send(JSON.stringify({ t:'welcome', id: p.id, mapHalf: MAP_HALF, mapSize: MAP_SIZE, mapType: MAP_TYPE, tickRate: TICK_RATE, spawnX: p.x, spawnY: p.y, walls }));
-            console.log('Authenticated Google player', p.id, p.name);
-            return;
-          } catch (err) {
-            console.warn('Auth failed', err && err.message);
-            try { ws.send(JSON.stringify({ t: 'auth_failed', reason: err.message })); } catch(e){}
-            ws.close(); return;
-          }
-        } else if (msg.t === 'join') {
-          // Guest join flow - create runtime player with numeric id
+        // Only accept guest join flow - create runtime player with numeric id
+        if (msg.t === 'join') {
           const name = (msg.name && String(msg.name).slice(0,24)) || ('Player' + (nextPlayerId++));
           const p = createPlayerRuntime(ws, { name });
           ws.authenticated = true; ws.playerId = p.id;
-          ws.send(JSON.stringify({ t:'welcome', id: p.id, mapHalf: MAP_HALF, mapSize: MAP_SIZE, mapType: MAP_TYPE, tickRate: TICK_RATE, spawnX: p.x, spawnY: p.y, walls }));
+          ws.send(JSON.stringify({ t:'welcome', id: p.id, mapHalf: MAP_HALF, mapSize: MAP_SIZE, mapType: MAP_TYPE, mapRadius: MAP_HALF, tickRate: TICK_RATE, spawnX: p.x, spawnY: p.y, walls }));
           return;
         } else {
-          try { ws.send(JSON.stringify({ t: 'need_auth' })); } catch (e) {}
+          try { ws.send(JSON.stringify({ t: 'need_join' })); } catch (e) {}
           return;
         }
       }
