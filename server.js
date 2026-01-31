@@ -29,30 +29,34 @@ let nextMobId = 1;
 const mobs = new Map();
 
 // --- Map walls (12x12 grid scaled) ---
+// Keep the box/row helpers so it's easy to author map pieces in cell coordinates.
 const CELL = MAP_SIZE / 12;
 const GAP = 40;
 function h(col, row, lenCells, id) { return { id: id || `h_${col}_${row}_${lenCells}`, x: -MAP_HALF + (col - 1) * CELL + GAP, y: -MAP_HALF + (row - 1) * CELL + GAP, w: Math.max(1, lenCells) * CELL - GAP * 2, h: WALL_THICKNESS }; }
 function v(col, row, lenCells, id) { return { id: id || `v_${col}_${row}_${lenCells}`, x: -MAP_HALF + (col - 1) * CELL + GAP, y: -MAP_HALF + (row - 1) * CELL + GAP, w: WALL_THICKNESS, h: Math.max(1, lenCells) * CELL - GAP * 2 }; }
 function box(col, row, wCells, hCells, id) { return { id: id || `box_${col}_${row}_${wCells}x${hCells}`, x: -MAP_HALF + (col - 1) * CELL + GAP, y: -MAP_HALF + (row - 1) * CELL + GAP, w: Math.max(1, wCells) * CELL - GAP * 2, h: Math.max(1, hCells) * CELL - GAP * 2 }; }
 
+// --- Open Plains with Scattered Cover ---
+// Replaced the previous complex walls with a light-scatter cover layout (map idea #10).
+// This creates mostly open area with small cover obstacles spread around the map.
 const walls = [
-  h(1,1,2,'top_pocket_left'),
-  h(10,1,3,'top_pocket_right'),
-  box(3,3,1,1,'island_top_left'),
-  box(6,2,1,1,'island_top_center'),
-  box(8,3,1,1,'island_top_right'),
-  v(1,4,3,'left_inner_v1'),
-  h(2,5,3,'left_mid_h'),
-  box(5,5,2,2,'center_island'),
-  box(4,9,2,1,'bottom_mid_small'),
-  v(10,2,5,'right_building_v'),
-  box(8,4,1,2,'right_inner_box'),
-  h(2,12,2,'bottom_pocket_left'),
-  h(6,12,2,'bottom_pocket_center'),
-  v(12,6,3,'right_pocket_vertical'),
-  box(3,8,1,1,'island_lower_left'),
-  box(9,7,1,1,'island_mid_right'),
-  box(7,9,1,1,'island_bottom_right')
+  // small isolated rocks / cover
+  box(2, 3, 1, 1, 'rock_1'),
+  box(4, 6, 1, 1, 'rock_2'),
+  box(6, 9, 1, 1, 'rock_3'),
+  box(9, 4, 1, 1, 'rock_4'),
+  box(11, 8, 1, 1, 'rock_5'),
+
+  // slightly larger cover patches
+  box(3, 10, 2, 1, 'cover_6'),
+  box(7, 2, 1, 2, 'cover_7'),
+  box(5, 5, 2, 2, 'cover_center_small'),
+  box(10, 10, 1, 1, 'rock_8'),
+  box(8, 7, 1, 1, 'rock_9'),
+
+  // some long low cover strips (small buildings / hedges)
+  box(2, 8, 1, 2, 'cover_10'),
+  box(6, 4, 2, 1, 'cover_11')
 ];
 
 // --- Mob definitions and spawn points ---
