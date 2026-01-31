@@ -3,7 +3,7 @@
 // Environment:
 //  - PORT (optional)
 //
-// NOTE: This server intentionally contains no registration/signup/auth code — it accepts guest joins only.
+// NOTE: Non-persistent: runtime-only player state (no accounts). This server accepts guest joins only.
 
 const http = require('http');
 const WebSocket = require('ws');
@@ -17,49 +17,36 @@ const MAP_TYPE = 'square';
 const TICK_RATE = 20;
 const TICK_DT = 1 / TICK_RATE;
 
-const CHAT_MAX_PER_WINDOW = 2;
-const CHAT_WINDOW_MS = 1000;
-
-const WALL_THICKNESS = 448;
-const SPAWN_MARGIN = 300;
-
 let nextPlayerId = 1;
 const players = new Map();
 let nextMobId = 1;
 const mobs = new Map();
 
-// --- Map walls (12x12 grid scaled) ---
-// Keep the box/row helpers so it's easy to author map pieces in cell coordinates.
+// --- Map helpers (same as before) ---
 const CELL = MAP_SIZE / 12;
 const GAP = 40;
+const WALL_THICKNESS = 448;
 function h(col, row, lenCells, id) { return { id: id || `h_${col}_${row}_${lenCells}`, x: -MAP_HALF + (col - 1) * CELL + GAP, y: -MAP_HALF + (row - 1) * CELL + GAP, w: Math.max(1, lenCells) * CELL - GAP * 2, h: WALL_THICKNESS }; }
 function v(col, row, lenCells, id) { return { id: id || `v_${col}_${row}_${lenCells}`, x: -MAP_HALF + (col - 1) * CELL + GAP, y: -MAP_HALF + (row - 1) * CELL + GAP, w: WALL_THICKNESS, h: Math.max(1, lenCells) * CELL - GAP * 2 }; }
 function box(col, row, wCells, hCells, id) { return { id: id || `box_${col}_${row}_${wCells}x${hCells}`, x: -MAP_HALF + (col - 1) * CELL + GAP, y: -MAP_HALF + (row - 1) * CELL + GAP, w: Math.max(1, wCells) * CELL - GAP * 2, h: Math.max(1, hCells) * CELL - GAP * 2 }; }
 
-// --- Open Plains with Scattered Cover ---
-// Replaced the previous complex walls with a light-scatter cover layout (map idea #10).
-// This creates mostly open area with small cover obstacles spread around the map.
+// Simple walls (kept small for demo)
 const walls = [
-  // small isolated rocks / cover
   box(2, 3, 1, 1, 'rock_1'),
   box(4, 6, 1, 1, 'rock_2'),
   box(6, 9, 1, 1, 'rock_3'),
   box(9, 4, 1, 1, 'rock_4'),
   box(11, 8, 1, 1, 'rock_5'),
-
-  // slightly larger cover patches
   box(3, 10, 2, 1, 'cover_6'),
   box(7, 2, 1, 2, 'cover_7'),
   box(5, 5, 2, 2, 'cover_center_small'),
   box(10, 10, 1, 1, 'rock_8'),
   box(8, 7, 1, 1, 'rock_9'),
-
-  // some long low cover strips (small buildings / hedges)
   box(2, 8, 1, 2, 'cover_10'),
   box(6, 4, 2, 1, 'cover_11')
 ];
 
-// --- Mob definitions and spawn points ---
+// --- Mob defs (unchanged) ---
 const mobDefs = {
   goblin: { name: 'Goblin', maxHp: 120, atk: 14, speed: 140, xp: 12, goldMin: 6, goldMax: 14, respawn: 12, radius: 22 },
   wolf:   { name: 'Wolf',   maxHp: 180, atk: 20, speed: 170, xp: 20, goldMin: 12, goldMax: 20, respawn: 18, radius: 26 },
@@ -85,25 +72,38 @@ function spawnMobAt(sp, typeName) {
 }
 for (const sp of mobSpawnPoints) for (let i=0;i<3;i++) spawnMobAt(sp, sp.types[Math.floor(Math.random()*sp.types.length)]);
 
-// --- Utilities ---
+// utilities
 function nowMs(){ return Date.now(); }
 function randRange(min,max){ return Math.random()*(max-min)+min; }
 
-// Spawn position
-function spawnPosition() { return { x: -MAP_HALF + SPAWN_MARGIN, y: MAP_HALF - SPAWN_MARGIN }; }
+// --- Player class defaults and utilities ---
+const CLASS_DEFAULTS = {
+  warrior: { baseHp: 250 },
+  ranger:  { baseHp: 200 },
+  mage:    { baseHp: 160 }
+};
+const HP_PER_LEVEL = 50; // per your choice
 
-// Create runtime player. If fixedId is provided, use that as player's id.
+function spawnPosition() { return { x: -MAP_HALF + 300, y: MAP_HALF - 300 }; }
+
+// Create runtime player with class, level, xp
 function createPlayerRuntime(ws, opts = {}) {
   const fixedId = opts.id || null;
   const id = fixedId ? String(fixedId) : String(nextPlayerId++);
   const pos = spawnPosition();
+  const cls = (opts.class && CLASS_DEFAULTS[opts.class]) ? opts.class : 'warrior';
+  const level = 1;
+  const xp = 0;
+  const base = CLASS_DEFAULTS[cls] || CLASS_DEFAULTS['warrior'];
+  const maxHp = base.baseHp + (level - 1) * HP_PER_LEVEL;
   const color = `hsl(${Math.floor(Math.random()*360)},70%,60%)`;
   const p = {
     id, name: opts.name || ('Player' + id),
     x: pos.x, y: pos.y, vx:0, vy:0, radius:28, color,
     ws, lastInput: { x:0, y:0 }, lastSeen: nowMs(), chatTimestamps: [],
-    maxHp: 200, hp: 200, xp: 0, gold: 0,
-    lastAttackTime: 0, attackCooldown: 0.6, baseDamage: 18, invulnerableUntil: 0
+    class: cls, level, xp, maxHp, hp: maxHp,
+    lastAttackTime: 0, attackCooldown: 0.6, baseDamage: 18, invulnerableUntil: 0,
+    gold: 0
   };
   players.set(String(p.id), p);
   return p;
@@ -119,7 +119,7 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ server });
 
-// Broadcast helper
+// broadcast helper
 function broadcast(obj) {
   const msg = JSON.stringify(obj);
   for (const p of players.values()) {
@@ -129,7 +129,7 @@ function broadcast(obj) {
   }
 }
 
-// Damage mob helper
+// damage / mob death helpers (unchanged except XP awarding)
 function damageMob(mob, amount, playerId) {
   if (!mob || mob.hp <= 0) return;
   mob.hp -= amount;
@@ -149,6 +149,17 @@ function handleMobDeath(mob) {
     const killer = players.get(String(topId));
     killer.gold = Number(killer.gold||0) + gold;
     killer.xp = Number(killer.xp||0) + xp;
+    // Check level-up (simple xp curve: needed = level * 100)
+    const needed = killer.level * 100;
+    if (killer.xp >= needed) {
+      killer.level += 1;
+      killer.xp -= needed;
+      // increase HP by +50 per level
+      killer.maxHp = (CLASS_DEFAULTS[killer.class]?.baseHp || 200) + (killer.level - 1) * HP_PER_LEVEL;
+      killer.hp = Math.min(killer.maxHp, killer.hp + HP_PER_LEVEL); // give HP gain (heal by gain)
+      // broadcast level up
+      broadcast({ t:'player_levelup', playerId: killer.id, playerName: killer.name, level: killer.level, hpGain: HP_PER_LEVEL, newMaxHp: killer.maxHp });
+    }
     broadcast({ t:'mob_died', mobId: mob.id, mobType: mob.type, killerId: killer.id, gold, xp });
   } else {
     broadcast({ t:'mob_died', mobId: mob.id, mobType: mob.type, killerId: null, gold:0, xp:0 });
@@ -157,7 +168,7 @@ function handleMobDeath(mob) {
   mob.hp = 0; mob.damageContrib = {};
 }
 
-// Collision push (server)
+// collision push (same as before)
 function resolveCircleAABB(p, rect) {
   const rx1 = rect.x, ry1 = rect.y, rx2 = rect.x + rect.w, ry2 = rect.y + rect.h;
   const closestX = Math.max(rx1, Math.min(p.x, rx2)); const closestY = Math.max(ry1, Math.min(p.y, ry2));
@@ -195,7 +206,7 @@ function serverTick() {
     }
   }
 
-  // update mobs
+  // update mobs (basic AI)
   for (const m of mobs.values()) {
     let target = null, bestD = Infinity;
     for (const p of players.values()) { if (p.hp <= 0) continue; const d = Math.hypot(m.x - p.x, m.y - p.y); if (d < m.aggroRadius && d < bestD) { bestD = d; target = p; } }
@@ -232,8 +243,8 @@ function serverTick() {
     p.lastSeen = now;
   }
 
-  // broadcast snapshot
-  const playerList = Array.from(players.values()).map(p => ({ id: p.id, name: p.name, x: Math.round(p.x), y: Math.round(p.y), vx: Math.round(p.vx), vy: Math.round(p.vy), radius: p.radius, color: p.color, hp: Math.round(p.hp), maxHp: Math.round(p.maxHp) }));
+  // broadcast snapshot (players include level & xp now)
+  const playerList = Array.from(players.values()).map(p => ({ id: p.id, name: p.name, x: Math.round(p.x), y: Math.round(p.y), vx: Math.round(p.vx), vy: Math.round(p.vy), radius: p.radius, color: p.color, hp: Math.round(p.hp), maxHp: Math.round(p.maxHp), level: p.level, xp: p.xp }));
   const mobList = Array.from(mobs.values()).map(m => ({ id: m.id, type: m.type, x: Math.round(m.x), y: Math.round(m.y), hp: Math.round(m.hp), maxHp: Math.round(m.maxHp), radius: m.radius }));
   broadcast({ t:'snapshot', tick: nowMs(), players: playerList, mobs: mobList });
 }
@@ -255,12 +266,14 @@ wss.on('connection', (ws, req) => {
       if (!msg || !msg.t) return;
 
       if (!ws.authenticated) {
-        // Only accept guest join flow - create runtime player with numeric id
+        // Guest join flow - accept optional class in join
         if (msg.t === 'join') {
           const name = (msg.name && String(msg.name).slice(0,24)) || ('Player' + (nextPlayerId++));
-          const p = createPlayerRuntime(ws, { name });
+          const cls = (msg.class && CLASS_DEFAULTS[msg.class]) ? msg.class : 'warrior';
+          const p = createPlayerRuntime(ws, { name, class: cls });
           ws.authenticated = true; ws.playerId = p.id;
-          ws.send(JSON.stringify({ t:'welcome', id: p.id, mapHalf: MAP_HALF, mapSize: MAP_SIZE, mapType: MAP_TYPE, mapRadius: MAP_HALF, tickRate: TICK_RATE, spawnX: p.x, spawnY: p.y, walls }));
+          ws.send(JSON.stringify({ t:'welcome', id: p.id, mapHalf: MAP_HALF, mapSize: MAP_SIZE, mapType: MAP_TYPE, tickRate: TICK_RATE, spawnX: p.x, spawnY: p.y, walls, player: { id: p.id, class: p.class, level: p.level, xp: p.xp, hp: p.hp, maxHp: p.maxHp } }));
+          console.log('Guest player joined', p.id, p.name, 'class=', p.class);
           return;
         } else {
           try { ws.send(JSON.stringify({ t: 'need_join' })); } catch (e) {}
@@ -283,11 +296,13 @@ wss.on('connection', (ws, req) => {
         }
       } else if (msg.t === 'chat') {
         const now = Date.now();
-        player.chatTimestamps = (player.chatTimestamps || []).filter(ts => now - ts < CHAT_WINDOW_MS);
-        if (player.chatTimestamps.length >= CHAT_MAX_PER_WINDOW) { try { ws.send(JSON.stringify({ t:'chat_blocked', reason:'rate_limit', ts: now })); } catch(e){} return; }
+        player.chatTimestamps = (player.chatTimestamps || []).filter(ts => now - ts < 1000);
+        if (player.chatTimestamps.length >= 2) { try { ws.send(JSON.stringify({ t:'chat_blocked', reason:'rate_limit', ts: now })); } catch(e){} return; }
         player.chatTimestamps.push(now);
         let text = String(msg.text||''); text = text.replace(/[\r\n]+/g,' ').slice(0,240);
         broadcast({ t: 'chat', name: player.name, text, ts: now, chatId: msg.chatId || null });
+      } else if (msg.t === 'cast') {
+        // future: handle skill casts
       } else if (msg.t === 'ping') {
         try { ws.send(JSON.stringify({ t: 'pong', ts: msg.ts || Date.now() })); } catch(e){}
       }
