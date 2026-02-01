@@ -3,7 +3,7 @@
 // Environment:
 //  - PORT (optional)
 //
-// NOTE: Non-persistent: runtime-only player state (no accounts). This server accepts guest joins only.
+// NOTE: This server intentionally contains no registration/signup/auth code — it accepts guest joins only.
 
 const http = require('http');
 const WebSocket = require('ws');
@@ -17,36 +17,51 @@ const MAP_TYPE = 'square';
 const TICK_RATE = 20;
 const TICK_DT = 1 / TICK_RATE;
 
+const CHAT_MAX_PER_WINDOW = 2;
+const CHAT_WINDOW_MS = 1000;
+
+const WALL_THICKNESS = 448;
+const SPAWN_MARGIN = 300;
+
 let nextPlayerId = 1;
 const players = new Map();
 let nextMobId = 1;
 const mobs = new Map();
 
-// --- Map helpers (same as before) ---
+// --- Projectiles ---
+const projectiles = new Map();
+let nextProjId = 1;
+
+// --- Map walls (12x12 grid scaled) ---
+// Keep the box/row helpers so it's easy to author map pieces in cell coordinates.
 const CELL = MAP_SIZE / 12;
 const GAP = 40;
-const WALL_THICKNESS = 448;
 function h(col, row, lenCells, id) { return { id: id || `h_${col}_${row}_${lenCells}`, x: -MAP_HALF + (col - 1) * CELL + GAP, y: -MAP_HALF + (row - 1) * CELL + GAP, w: Math.max(1, lenCells) * CELL - GAP * 2, h: WALL_THICKNESS }; }
 function v(col, row, lenCells, id) { return { id: id || `v_${col}_${row}_${lenCells}`, x: -MAP_HALF + (col - 1) * CELL + GAP, y: -MAP_HALF + (row - 1) * CELL + GAP, w: WALL_THICKNESS, h: Math.max(1, lenCells) * CELL - GAP * 2 }; }
 function box(col, row, wCells, hCells, id) { return { id: id || `box_${col}_${row}_${wCells}x${hCells}`, x: -MAP_HALF + (col - 1) * CELL + GAP, y: -MAP_HALF + (row - 1) * CELL + GAP, w: Math.max(1, wCells) * CELL - GAP * 2, h: Math.max(1, hCells) * CELL - GAP * 2 }; }
 
-// Simple walls (kept small for demo)
+// --- Open Plains with Scattered Cover ---
 const walls = [
+  // small isolated rocks / cover
   box(2, 3, 1, 1, 'rock_1'),
   box(4, 6, 1, 1, 'rock_2'),
   box(6, 9, 1, 1, 'rock_3'),
   box(9, 4, 1, 1, 'rock_4'),
   box(11, 8, 1, 1, 'rock_5'),
+
+  // slightly larger cover patches
   box(3, 10, 2, 1, 'cover_6'),
   box(7, 2, 1, 2, 'cover_7'),
   box(5, 5, 2, 2, 'cover_center_small'),
   box(10, 10, 1, 1, 'rock_8'),
   box(8, 7, 1, 1, 'rock_9'),
+
+  // some long low cover strips (small buildings / hedges)
   box(2, 8, 1, 2, 'cover_10'),
   box(6, 4, 2, 1, 'cover_11')
 ];
 
-// --- Mob defs (unchanged) ---
+// --- Mob definitions and spawn points ---
 const mobDefs = {
   goblin: { name: 'Goblin', maxHp: 120, atk: 14, speed: 140, xp: 12, goldMin: 6, goldMax: 14, respawn: 12, radius: 22 },
   wolf:   { name: 'Wolf',   maxHp: 180, atk: 20, speed: 170, xp: 20, goldMin: 12, goldMax: 20, respawn: 18, radius: 26 },
@@ -72,38 +87,57 @@ function spawnMobAt(sp, typeName) {
 }
 for (const sp of mobSpawnPoints) for (let i=0;i<3;i++) spawnMobAt(sp, sp.types[Math.floor(Math.random()*sp.types.length)]);
 
-// utilities
+// --- Abilities / Skill definitions (server-side authoritative)
+const SKILL_DEFS = {
+  warrior: [
+    // slot1: instant slash AOE around caster
+    { kind: 'aoe', damage: 60, radius: 64, ttl: 0, type: 'slash' },
+    { kind: 'aoe', damage: 40, radius: 48, ttl: 0, type: 'shieldbash' },
+    { kind: 'aoe', damage: 50, radius: 80, ttl: 0, type: 'charge' },
+    { kind: 'aoe', damage: 120, radius: 90, ttl: 0, type: 'rage' }
+  ],
+  ranger: [
+    { kind: 'proj', damage: 40, speed: 680, radius: 6, ttlMs: 3000, type: 'arrow' },
+    { kind: 'proj', damage: 30, speed: 720, radius: 5, ttlMs: 2500, type: 'rapid' },
+    { kind: 'proj', damage: 12, speed: 380, radius: 8, ttlMs: 1600, type: 'trap' },
+    { kind: 'proj', damage: 85, speed: 880, radius: 7, ttlMs: 3500, type: 'snipe' }
+  ],
+  mage: [
+    { kind: 'proj', damage: 45, speed: 420, radius: 10, ttlMs: 3000, type: 'spark' },
+    { kind: 'proj_explode', damage: 70, speed: 360, radius: 10, ttlMs: 3000, explodeRadius: 90, type: 'fireball' },
+    { kind: 'aoe', damage: 60, radius: 120, ttl: 0, type: 'frostnova' },
+    { kind: 'proj', damage: 120, speed: 520, radius: 12, ttlMs: 3200, type: 'arcane' }
+  ]
+};
+
+// Convert CLASS COOLDOWNS to ms
+const CLASS_COOLDOWNS_MS = {
+  warrior: [3500,7000,10000,25000],
+  ranger:  [2000,6000,12000,18000],
+  mage:    [2500,6500,9000,22000]
+};
+
+// --- Utilities ---
 function nowMs(){ return Date.now(); }
 function randRange(min,max){ return Math.random()*(max-min)+min; }
 
-// --- Player class defaults and utilities ---
-const CLASS_DEFAULTS = {
-  warrior: { baseHp: 250 },
-  ranger:  { baseHp: 200 },
-  mage:    { baseHp: 160 }
-};
-const HP_PER_LEVEL = 50; // per your choice
+// Spawn position
+function spawnPosition() { return { x: -MAP_HALF + SPAWN_MARGIN, y: MAP_HALF - SPAWN_MARGIN }; }
 
-function spawnPosition() { return { x: -MAP_HALF + 300, y: MAP_HALF - 300 }; }
-
-// Create runtime player with class, level, xp
+// Create runtime player. If fixedId is provided, use that as player's id.
 function createPlayerRuntime(ws, opts = {}) {
   const fixedId = opts.id || null;
   const id = fixedId ? String(fixedId) : String(nextPlayerId++);
   const pos = spawnPosition();
-  const cls = (opts.class && CLASS_DEFAULTS[opts.class]) ? opts.class : 'warrior';
-  const level = 1;
-  const xp = 0;
-  const base = CLASS_DEFAULTS[cls] || CLASS_DEFAULTS['warrior'];
-  const maxHp = base.baseHp + (level - 1) * HP_PER_LEVEL;
   const color = `hsl(${Math.floor(Math.random()*360)},70%,60%)`;
   const p = {
     id, name: opts.name || ('Player' + id),
     x: pos.x, y: pos.y, vx:0, vy:0, radius:28, color,
     ws, lastInput: { x:0, y:0 }, lastSeen: nowMs(), chatTimestamps: [],
-    class: cls, level, xp, maxHp, hp: maxHp,
+    maxHp: 200, hp: 200, xp: 0, gold: 0,
     lastAttackTime: 0, attackCooldown: 0.6, baseDamage: 18, invulnerableUntil: 0,
-    gold: 0
+    class: opts.class || 'warrior',
+    cooldowns: {} // slot cooldown timestamps (ms) keyed by slot index 1..4
   };
   players.set(String(p.id), p);
   return p;
@@ -119,7 +153,7 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ server });
 
-// broadcast helper
+// Broadcast helper
 function broadcast(obj) {
   const msg = JSON.stringify(obj);
   for (const p of players.values()) {
@@ -129,7 +163,7 @@ function broadcast(obj) {
   }
 }
 
-// damage / mob death helpers (unchanged except XP awarding)
+// Damage mob helper
 function damageMob(mob, amount, playerId) {
   if (!mob || mob.hp <= 0) return;
   mob.hp -= amount;
@@ -149,17 +183,6 @@ function handleMobDeath(mob) {
     const killer = players.get(String(topId));
     killer.gold = Number(killer.gold||0) + gold;
     killer.xp = Number(killer.xp||0) + xp;
-    // Check level-up (simple xp curve: needed = level * 100)
-    const needed = killer.level * 100;
-    if (killer.xp >= needed) {
-      killer.level += 1;
-      killer.xp -= needed;
-      // increase HP by +50 per level
-      killer.maxHp = (CLASS_DEFAULTS[killer.class]?.baseHp || 200) + (killer.level - 1) * HP_PER_LEVEL;
-      killer.hp = Math.min(killer.maxHp, killer.hp + HP_PER_LEVEL); // give HP gain (heal by gain)
-      // broadcast level up
-      broadcast({ t:'player_levelup', playerId: killer.id, playerName: killer.name, level: killer.level, hpGain: HP_PER_LEVEL, newMaxHp: killer.maxHp });
-    }
     broadcast({ t:'mob_died', mobId: mob.id, mobType: mob.type, killerId: killer.id, gold, xp });
   } else {
     broadcast({ t:'mob_died', mobId: mob.id, mobType: mob.type, killerId: null, gold:0, xp:0 });
@@ -168,19 +191,18 @@ function handleMobDeath(mob) {
   mob.hp = 0; mob.damageContrib = {};
 }
 
-// collision push (same as before)
-function resolveCircleAABB(p, rect) {
-  const rx1 = rect.x, ry1 = rect.y, rx2 = rect.x + rect.w, ry2 = rect.y + rect.h;
-  const closestX = Math.max(rx1, Math.min(p.x, rx2)); const closestY = Math.max(ry1, Math.min(p.y, ry2));
-  let dx = p.x - closestX, dy = p.y - closestY; const distSq = dx*dx + dy*dy;
-  if (distSq === 0) {
-    const leftDist = Math.abs(p.x - rx1), rightDist = Math.abs(rx2 - p.x), topDist = Math.abs(p.y - ry1), bottomDist = Math.abs(ry2 - p.y);
-    const minHoriz = Math.min(leftDist, rightDist), minVert = Math.min(topDist, bottomDist);
-    if (minHoriz < minVert) { if (leftDist < rightDist) p.x = rx1 - p.radius - 0.1; else p.x = rx2 + p.radius + 0.1; } else { if (topDist < bottomDist) p.y = ry1 - p.radius - 0.1; else p.y = ry2 + p.radius + 0.1; }
-    p.vx = 0; p.vy = 0; return;
+// Player damage & death
+function applyDamageToPlayer(targetPlayer, amount, attackerId) {
+  if (!targetPlayer || targetPlayer.hp <= 0) return;
+  targetPlayer.hp -= amount;
+  if (targetPlayer.hp <= 0) {
+    handlePlayerDeath(targetPlayer, attackerId ? { id: attackerId } : null);
+    // broadcast player death
+    broadcast({ t: 'player_died', id: targetPlayer.id, killerId: attackerId || null });
+  } else {
+    // broadcast damage event (clients can play hit effects)
+    broadcast({ t: 'player_hurt', id: targetPlayer.id, hp: Math.round(targetPlayer.hp), source: attackerId || null });
   }
-  const dist = Math.sqrt(distSq); const overlap = p.radius - dist;
-  if (overlap > 0) { dx /= dist; dy /= dist; p.x += dx * overlap; p.y += dy * overlap; const vn = p.vx * dx + p.vy * dy; if (vn > 0) { p.vx -= vn * dx; p.vy -= vn * dy; } }
 }
 
 function handlePlayerDeath(player, killer) {
@@ -196,7 +218,22 @@ function handlePlayerDeath(player, killer) {
   player.hp = 0;
 }
 
-// Server tick: mobs/player updates & snapshots
+// --- Collision push (server)
+function resolveCircleAABB(p, rect) {
+  const rx1 = rect.x, ry1 = rect.y, rx2 = rect.x + rect.w, ry2 = rect.y + rect.h;
+  const closestX = Math.max(rx1, Math.min(p.x, rx2)); const closestY = Math.max(ry1, Math.min(p.y, ry2));
+  let dx = p.x - closestX, dy = p.y - closestY; const distSq = dx*dx + dy*dy;
+  if (distSq === 0) {
+    const leftDist = Math.abs(p.x - rx1), rightDist = Math.abs(rx2 - p.x), topDist = Math.abs(p.y - ry1), bottomDist = Math.abs(ry2 - p.y);
+    const minHoriz = Math.min(leftDist, rightDist), minVert = Math.min(topDist, bottomDist);
+    if (minHoriz < minVert) { if (leftDist < rightDist) p.x = rx1 - p.radius - 0.1; else p.x = rx2 + p.radius + 0.1; } else { if (topDist < bottomDist) p.y = ry1 - p.radius - 0.1; else p.y = ry2 + p.radius + 0.1; }
+    p.vx = 0; p.vy = 0; return;
+  }
+  const dist = Math.sqrt(distSq); const overlap = p.radius - dist;
+  if (overlap > 0) { dx /= dist; dy /= dist; p.x += dx * overlap; p.y += dy * overlap; const vn = p.vx * dx + p.vy * dy; if (vn > 0) { p.vx -= vn * dx; p.vy -= vn * dy; } }
+}
+
+// --- Server tick: mobs/player updates & projectiles & snapshots
 function serverTick() {
   const now = nowMs();
   // respawn mobs
@@ -206,7 +243,7 @@ function serverTick() {
     }
   }
 
-  // update mobs (basic AI)
+  // update mobs
   for (const m of mobs.values()) {
     let target = null, bestD = Infinity;
     for (const p of players.values()) { if (p.hp <= 0) continue; const d = Math.hypot(m.x - p.x, m.y - p.y); if (d < m.aggroRadius && d < bestD) { bestD = d; target = p; } }
@@ -243,10 +280,48 @@ function serverTick() {
     p.lastSeen = now;
   }
 
-  // broadcast snapshot (players include level & xp now)
-  const playerList = Array.from(players.values()).map(p => ({ id: p.id, name: p.name, x: Math.round(p.x), y: Math.round(p.y), vx: Math.round(p.vx), vy: Math.round(p.vy), radius: p.radius, color: p.color, hp: Math.round(p.hp), maxHp: Math.round(p.maxHp), level: p.level, xp: p.xp }));
+  // update projectiles
+  const toRemove = [];
+  for (const [id,proj] of projectiles.entries()) {
+    const dt = TICK_DT;
+    if (!proj) continue;
+    if (proj.ttl && now >= proj.ttl) { toRemove.push(id); continue; }
+    // move
+    proj.x += proj.vx * dt;
+    proj.y += proj.vy * dt;
+    // clamp to map
+    const limit = MAP_HALF - (proj.radius || 6) - 1;
+    if (proj.x > limit) proj.x = limit; if (proj.x < -limit) proj.x = -limit; if (proj.y > limit) proj.y = limit; if (proj.y < -limit) proj.y = -limit;
+    // collisions with mobs
+    let hit = false;
+    for (const m of mobs.values()) {
+      if (m.hp <= 0) continue;
+      const d = Math.hypot(proj.x - m.x, proj.y - m.y);
+      if (d <= ((proj.radius || 6) + (m.radius || 12))) {
+        damageMob(m, proj.damage, proj.ownerId);
+        hit = true; break;
+      }
+    }
+    if (hit) { toRemove.push(id); continue; }
+    // collisions with players (PvP)
+    for (const p of players.values()) {
+      if (String(p.id) === String(proj.ownerId)) continue; // don't hit owner
+      if (p.hp <= 0) continue;
+      const d = Math.hypot(proj.x - p.x, proj.y - p.y);
+      if (d <= ((proj.radius || 6) + (p.radius || 12))) {
+        applyDamageToPlayer(p, proj.damage, proj.ownerId);
+        hit = true; break;
+      }
+    }
+    if (hit) { toRemove.push(id); continue; }
+  }
+  for (const id of toRemove) projectiles.delete(id);
+
+  // broadcast snapshot
+  const playerList = Array.from(players.values()).map(p => ({ id: p.id, name: p.name, x: Math.round(p.x), y: Math.round(p.y), vx: Math.round(p.vx), vy: Math.round(p.vy), radius: p.radius, color: p.color, hp: Math.round(p.hp), maxHp: Math.round(p.maxHp), level: 1 }));
   const mobList = Array.from(mobs.values()).map(m => ({ id: m.id, type: m.type, x: Math.round(m.x), y: Math.round(m.y), hp: Math.round(m.hp), maxHp: Math.round(m.maxHp), radius: m.radius }));
-  broadcast({ t:'snapshot', tick: nowMs(), players: playerList, mobs: mobList });
+  const projList = Array.from(projectiles.values()).map(p => ({ id: p.id, type: p.type, x: Math.round(p.x), y: Math.round(p.y), vx: Math.round(p.vx), vy: Math.round(p.vy), radius: p.radius, owner: p.ownerId, ttl: Math.max(0, p.ttl ? Math.round(p.ttl - now) : 0) }));
+  broadcast({ t:'snapshot', tick: nowMs(), players: playerList, mobs: mobList, projectiles: projList });
 }
 
 setInterval(serverTick, Math.round(1000 / TICK_RATE));
@@ -266,14 +341,12 @@ wss.on('connection', (ws, req) => {
       if (!msg || !msg.t) return;
 
       if (!ws.authenticated) {
-        // Guest join flow - accept optional class in join
+        // Only accept guest join flow - create runtime player with numeric id
         if (msg.t === 'join') {
           const name = (msg.name && String(msg.name).slice(0,24)) || ('Player' + (nextPlayerId++));
-          const cls = (msg.class && CLASS_DEFAULTS[msg.class]) ? msg.class : 'warrior';
-          const p = createPlayerRuntime(ws, { name, class: cls });
+          const p = createPlayerRuntime(ws, { name, class: (msg.class || 'warrior') });
           ws.authenticated = true; ws.playerId = p.id;
-          ws.send(JSON.stringify({ t:'welcome', id: p.id, mapHalf: MAP_HALF, mapSize: MAP_SIZE, mapType: MAP_TYPE, tickRate: TICK_RATE, spawnX: p.x, spawnY: p.y, walls, player: { id: p.id, class: p.class, level: p.level, xp: p.xp, hp: p.hp, maxHp: p.maxHp } }));
-          console.log('Guest player joined', p.id, p.name, 'class=', p.class);
+          ws.send(JSON.stringify({ t:'welcome', id: p.id, mapHalf: MAP_HALF, mapSize: MAP_SIZE, mapType: MAP_TYPE, mapRadius: MAP_HALF, tickRate: TICK_RATE, spawnX: p.x, spawnY: p.y, walls, player: { class: p.class, level: 1, xp: p.xp } }));
           return;
         } else {
           try { ws.send(JSON.stringify({ t: 'need_join' })); } catch (e) {}
@@ -296,15 +369,73 @@ wss.on('connection', (ws, req) => {
         }
       } else if (msg.t === 'chat') {
         const now = Date.now();
-        player.chatTimestamps = (player.chatTimestamps || []).filter(ts => now - ts < 1000);
-        if (player.chatTimestamps.length >= 2) { try { ws.send(JSON.stringify({ t:'chat_blocked', reason:'rate_limit', ts: now })); } catch(e){} return; }
+        player.chatTimestamps = (player.chatTimestamps || []).filter(ts => now - ts < CHAT_WINDOW_MS);
+        if (player.chatTimestamps.length >= CHAT_MAX_PER_WINDOW) { try { ws.send(JSON.stringify({ t:'chat_blocked', reason:'rate_limit', ts: now })); } catch(e){} return; }
         player.chatTimestamps.push(now);
         let text = String(msg.text||''); text = text.replace(/[\r\n]+/g,' ').slice(0,240);
         broadcast({ t: 'chat', name: player.name, text, ts: now, chatId: msg.chatId || null });
-      } else if (msg.t === 'cast') {
-        // future: handle skill casts
       } else if (msg.t === 'ping') {
         try { ws.send(JSON.stringify({ t: 'pong', ts: msg.ts || Date.now() })); } catch(e){}
+      } else if (msg.t === 'cast') {
+        // Server-side authoritative cast handling
+        const slot = Math.max(1, Math.min(4, Number(msg.slot || 1)));
+        const cls = String(msg.class || player.class || 'warrior');
+        const now = Date.now();
+        // cooldown check
+        player.cooldowns = player.cooldowns || {};
+        const cdKey = `s${slot}`;
+        const cooldowns = CLASS_COOLDOWNS_MS[cls] || [6000,6000,6000,6000];
+        const cdUntil = player.cooldowns[cdKey] || 0;
+        if (now < cdUntil) {
+          // still cooling, ignore
+          try { ws.send(JSON.stringify({ t:'cast_rejected', reason:'cooldown', slot })); } catch(e){}
+          return;
+        }
+        // basic validation: alive
+        if (player.hp <= 0) return;
+        // get skill def
+        const defs = SKILL_DEFS[cls] || SKILL_DEFS['warrior'];
+        const def = defs[Math.max(0, Math.min(slot-1, defs.length-1))];
+        if (!def) return;
+        // set cooldown
+        const cdMs = cooldowns[Math.max(0, slot-1)] || 6000;
+        player.cooldowns[cdKey] = now + cdMs;
+
+        // get angle from client if present (validate)
+        let angle = 0;
+        if (typeof msg.angle === 'number' && isFinite(msg.angle)) angle = Number(msg.angle);
+        // default to facing direction (no facing tracked server-side - fallback random)
+        // create effect based on kind
+        if (def.kind === 'aoe') {
+          // immediate aoe centered on player
+          const ax = player.x, ay = player.y;
+          // damage mobs
+          for (const m of mobs.values()) {
+            if (m.hp <= 0) continue;
+            const d = Math.hypot(m.x - ax, m.y - ay);
+            if (d <= def.radius + (m.radius || 12)) damageMob(m, def.damage, player.id);
+          }
+          // damage players (PvP)
+          for (const p of players.values()) {
+            if (String(p.id) === String(player.id)) continue;
+            if (p.hp <= 0) continue;
+            const d = Math.hypot(p.x - ax, p.y - ay);
+            if (d <= def.radius + (p.radius || 12)) applyDamageToPlayer(p, def.damage, player.id);
+          }
+          // notify clients of cast effect (clients can show VFX)
+          broadcast({ t: 'cast_effect', casterId: player.id, casterName: player.name, type: def.type || 'aoe', skill: def.type || 'aoe', x: Math.round(ax), y: Math.round(ay), radius: def.radius, damage: def.damage });
+        } else if (def.kind === 'proj' || def.kind === 'proj_explode') {
+          // create projectile
+          const angleToUse = angle || 0;
+          const speed = def.speed || 500;
+          const vx = Math.cos(angleToUse) * speed;
+          const vy = Math.sin(angleToUse) * speed;
+          const id = 'proj_' + (nextProjId++);
+          const ttl = (def.ttlMs ? now + def.ttlMs : now + 3000);
+          const proj = { id, type: def.type || 'proj', x: player.x, y: player.y, vx, vy, radius: def.radius || 6, ownerId: player.id, damage: def.damage || 10, ttl, explodeRadius: def.explodeRadius || 0, kind: def.kind };
+          projectiles.set(id, proj);
+          // no immediate broadcast required; snapshot will include it on next tick
+        }
       }
     } catch (err) {
       // ignore malformed
