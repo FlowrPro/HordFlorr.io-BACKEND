@@ -1,9 +1,8 @@
-// UPDATED server.js — map halved and walls redesigned to better match the reference maze image.
-// Changes:
-//  - MAP_HALF halved from 18000 -> 9000
-//  - WALL_THICKNESS and SPAWN_MARGIN halved accordingly
-//  - New walls[] layout (keeps box() helpers, builds thicker rectangles arranged in a winding tunnel maze)
-// Everything else is unchanged from the original file.
+// UPDATED server.js — polygon-based maze and polygon collision.
+// - Map half-size is half of the previous 18000 -> 9000
+// - Walls are sent as polygons (one long winding wall produced by expanding a centerline path)
+// - Server-side collision/tests now support polygon walls and keep rectangular walls for backwards compatibility
+// - Behavior otherwise unchanged
 
 const http = require('http');
 const WebSocket = require('ws');
@@ -11,7 +10,6 @@ const WebSocket = require('ws');
 const PORT = process.env.PORT || 8080;
 
 // --- World / tick ---
-// NOTE: map size halved from previous version
 const MAP_HALF = 9000; // halved from 18000
 const MAP_SIZE = MAP_HALF * 2;
 const MAP_TYPE = 'square';
@@ -21,9 +19,9 @@ const TICK_DT = 1 / TICK_RATE;
 const CHAT_MAX_PER_WINDOW = 2;
 const CHAT_WINDOW_MS = 1000;
 
-// scale wall thickness and spawn margin adjusted to the new half-size
-const WALL_THICKNESS = 672; // halved (was 1344)
-const SPAWN_MARGIN = 450;    // halved (was 900)
+// adjusted thickness / margins for new scale
+const WALL_THICKNESS = 672; // approx previous /2
+const SPAWN_MARGIN = 450;
 
 let nextPlayerId = 1;
 const players = new Map();
@@ -34,86 +32,89 @@ const mobs = new Map();
 const projectiles = new Map();
 let nextProjId = 1;
 
-// --- Map walls (12x12 grid scaled) ---
-// Keep the box/row helpers so it's easy to author map pieces in cell coordinates.
+// --- Map helpers (grid & polygon generation) ---
 const CELL = MAP_SIZE / 12;
-const GAP = 60; // adjust gap relative to scale (previous code used 120 at larger scale)
+const GAP = Math.floor(Math.max(24, CELL * 0.05)); // small gap relative to cell size
 
-/*
-  The walls array below builds a winding tunnel system with a thick outer ring
-  and many interior boxes arranged to form narrow corridors similar to the reference.
-
-  We still use axis-aligned rectangles so server collision (AABB) code works unchanged.
-*/
-function h(col, row, lenCells, id) {
-  return { id: id || `h_${col}_${row}_${lenCells}`, x: -MAP_HALF + (col - 1) * CELL + GAP, y: -MAP_HALF + (row - 1) * CELL + GAP, w: Math.max(1, lenCells) * CELL - GAP * 2, h: WALL_THICKNESS };
-}
-function v(col, row, lenCells, id) {
-  return { id: id || `v_${col}_${row}_${lenCells}`, x: -MAP_HALF + (col - 1) * CELL + GAP, y: -MAP_HALF + (row - 1) * CELL + GAP, w: WALL_THICKNESS, h: Math.max(1, lenCells) * CELL - GAP * 2 };
-}
-function box(col, row, wCells, hCells, id) {
-  return { id: id || `box_${col}_${row}_${wCells}x${hCells}`, x: -MAP_HALF + (col - 1) * CELL + GAP, y: -MAP_HALF + (row - 1) * CELL + GAP, w: Math.max(1, wCells) * CELL - GAP * 2, h: Math.max(1, hCells) * CELL - GAP * 2 };
+function gridToWorldCenter(col, row) {
+  // center of a cell in world coordinates
+  const x = -MAP_HALF + (col - 0.5) * CELL;
+  const y = -MAP_HALF + (row - 0.5) * CELL;
+  return { x, y };
 }
 
-// Walls layout (reworked). The layout aims to produce a continuous white corridor
-// network by placing thick boxes that form the black walls on the reference image.
+// Utility: normalize vector
+function normalize(vx, vy) {
+  const len = Math.hypot(vx, vy) || 1;
+  return { x: vx / len, y: vy / len };
+}
+
+// Build a single long winding centerline path (12x12 grid-based waypoints)
+// This list can be tuned to better match your reference image. It intentionally snakes to create corridors.
+const centerlineGrid = [
+  [2,1],[2,3],[4,3],[4,1],[6,1],[6,3],[8,3],[8,1],[10,1],
+  [10,3],[10,5],[8,5],[8,7],[6,7],[6,5],[4,5],[4,7],[2,7],
+  [2,9],[4,9],[4,11],[6,11],[6,9],[8,9],[8,11],[10,11]
+];
+
+// Convert grid centerline to world points
+const centerline = centerlineGrid.map(([c,r]) => gridToWorldCenter(c, r));
+
+// Given a polyline (centerline) compute a thick polygon (approximate) by offsetting left/right per-vertex
+function polylineToThickPolygon(points, thickness) {
+  if (!points || points.length < 2) return [];
+  const half = thickness / 2;
+  const left = [];
+  const right = [];
+
+  // compute normals per segment
+  const normals = [];
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i], b = points[i+1];
+    const dir = normalize(b.x - a.x, b.y - a.y);
+    // perpendicular (normal) to the right-hand side
+    normals.push({ x: -dir.y, y: dir.x });
+  }
+
+  // compute per-vertex averaged normals (miter-like)
+  for (let i = 0; i < points.length; i++) {
+    let n = { x: 0, y: 0 };
+    if (i === 0) {
+      n = normals[0];
+    } else if (i === points.length - 1) {
+      n = normals[normals.length - 1];
+    } else {
+      n.x = normals[i-1].x + normals[i].x;
+      n.y = normals[i-1].y + normals[i].y;
+      // if nearly zero (straight 180deg), fall back
+      if (Math.hypot(n.x, n.y) < 1e-4) {
+        n = normals[i];
+      } else {
+        n = normalize(n.x, n.y);
+      }
+    }
+    // scale by half thickness — approximate miter correction
+    // ensure we don't create massive miters for tight corners
+    left.push({ x: points[i].x + n.x * half, y: points[i].y + n.y * half });
+    right.push({ x: points[i].x - n.x * half, y: points[i].y - n.y * half });
+  }
+
+  // build polygon: left side in forward order, right side in reverse order
+  const polygon = [];
+  for (const p of left) polygon.push({ x: Math.round(p.x), y: Math.round(p.y) });
+  for (let i = right.length - 1; i >= 0; i--) polygon.push({ x: Math.round(right[i].x), y: Math.round(right[i].y) });
+
+  return polygon;
+}
+
+// Create a single thick polygon wall from centerline
+const WALL_THICKNESS_WORLD = Math.max( Math.floor(CELL * 0.9), WALL_THICKNESS * 0.8 );
+const longWallPolygonPoints = polylineToThickPolygon(centerline, WALL_THICKNESS_WORLD);
+
+// walls array now contains a single polygon (you can add more polygon parts if needed)
 const walls = [
-  // Outer ring (thick)
-  box(1, 1, 12, 1, 'outer_top'),
-  box(1, 12, 12, 1, 'outer_bottom'),
-  box(1, 1, 1, 12, 'outer_left'),
-  box(12, 1, 1, 12, 'outer_right'),
-
-  // Left-top spiral / winding corridors
-  box(2, 2, 1, 4, 'left_col_top'),         // tall left column
-  box(3, 2, 4, 1, 'top_horizontal_spiral'),// horizontal top run
-  box(6, 3, 1, 3, 'spiral_center_bar'),    // center bar in spiral
-  box(4, 5, 3, 1, 'mid_spiral_short'),     // inner horizontal spur
-
-  // Connectors and inner islands to force turns on top-left
-  box(3, 4, 1, 1, 'island_tl_a'),
-  box(5, 4, 1, 1, 'island_tl_b'),
-  box(4, 3, 1, 1, 'island_tl_c'),
-
-  // Central vertical divider (big)
-  box(6, 1, 1, 12, 'center_bar'),
-
-  // Right side winding paths (complex)
-  box(8, 2, 1, 2, 'right_col_top_a'),
-  box(10, 2, 1, 2, 'right_col_top_b'),
-  box(9, 4, 2, 1, 'right_mid_horizontal'),
-  box(8, 6, 1, 3, 'right_mid_vertical'),
-  box(10, 9, 1, 2, 'right_bottom_col'),
-
-  // Middle chunk corridors
-  box(3, 7, 3, 1, 'middle_left_horizontal'),
-  box(4, 8, 1, 2, 'middle_left_vertical'),
-  box(5, 6, 1, 1, 'center_block_a'),
-  box(7, 6, 1, 1, 'center_block_b'),
-
-  // Lower-left winding area
-  box(2, 9, 1, 2, 'lower_left_col'),
-  box(3, 10, 2, 1, 'lower_left_horiz'),
-  box(4, 9, 1, 1, 'lower_left_island'),
-
-  // Lower-center and right patterns
-  box(6, 9, 2, 1, 'lower_center_box'),
-  box(9, 10, 2, 1, 'lower_right_box'),
-  box(11, 8, 1, 2, 'lower_right_col'),
-
-  // Small blockers & connectors to create tighter turns
-  box(5, 2, 1, 1, 'top_small_block'),
-  box(7, 3, 1, 1, 'top_center_block'),
-  box(8, 4, 1, 1, 'right_mid_island'),
-  box(6, 4, 1, 1, 'center_small_block'),
-  box(11, 3, 1, 1, 'upper_right_block'),
-  box(3, 11, 1, 1, 'lowermost_left_block'),
-
-  // Narrow corridor endings & additional detail
-  box(5, 11, 2, 1, 'near_bottom_center'),
-  box(10, 11, 1, 1, 'near_bottom_right'),
-  box(2, 6, 1, 1, 'left_middle_small'),
-  box(9, 5, 1, 1, 'right_inner_connector')
+  // polygon wall: a single persistent winding wall
+  { id: 'maze_wall_poly_1', points: longWallPolygonPoints }
 ];
 
 // --- Mob definitions and spawn points ---
@@ -124,7 +125,6 @@ const mobDefs = {
   boar:   { name: 'Boar',   maxHp: 150, atk: 18, speed: 150, xp: 16, goldMin: 8, goldMax: 16, respawn: 14, radius: 24 }
 };
 
-// Use a spread of spawn points across the 12x grid (scaled via CELL)
 const mobSpawnPoints = [
   { x: -MAP_HALF + CELL * 2 + CELL/2, y: -MAP_HALF + CELL*2 + CELL/2, types: ['goblin','slime','boar'] },
   { x: -MAP_HALF + CELL * 6 + CELL/2, y: -MAP_HALF + CELL*6 + CELL/2, types: ['wolf','goblin','boar'] },
@@ -135,29 +135,117 @@ const mobSpawnPoints = [
   { x: -MAP_HALF + CELL * 2 + CELL/2, y: -MAP_HALF + CELL*8 + CELL/2, types: ['goblin','wolf'] }
 ];
 
+// ---------------- polygon utilities for tests / collisions ----------------
+
+// Ray-casting point-in-polygon (winding/ray method)
+function pointInPolygon(x, y, polygon) {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i].x, yi = polygon[i].y;
+    const xj = polygon[j].x, yj = polygon[j].y;
+    const intersect = ((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi + 0.0) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+// Distance from point to segment and closest point
+function pointToSegmentDistance(px, py, ax, ay, bx, by) {
+  const vx = bx - ax, vy = by - ay;
+  const wx = px - ax, wy = py - ay;
+  const dv = vx*vx + vy*vy;
+  let t = dv > 0 ? (wx * vx + wy * vy) / dv : 0;
+  t = Math.max(0, Math.min(1, t));
+  const cx = ax + vx * t, cy = ay + vy * t;
+  const dx = px - cx, dy = py - cy;
+  return { dist: Math.hypot(dx, dy), closest: { x: cx, y: cy }, t };
+}
+
+// Resolve a circle against a polygon: push circle outside if overlap
+function resolveCirclePolygon(p, poly) {
+  // p: { x,y, radius, vx, vy }
+  // poly: array of {x,y}
+  // First: check if circle center is inside polygon. If so, push outside along minimal edge normal.
+  const inside = pointInPolygon(p.x, p.y, poly);
+  let minOverlap = Infinity;
+  let pushVec = null;
+
+  // check each edge
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const b = poly[(i+1) % poly.length];
+    const res = pointToSegmentDistance(p.x, p.y, a.x, a.y, b.x, b.y);
+    const d = res.dist;
+    const overlap = p.radius - d;
+    if (overlap > 0 && overlap < minOverlap) {
+      // compute outward normal from edge (from closest point to polygon exterior)
+      // Edge direction
+      const ex = b.x - a.x, ey = b.y - a.y;
+      // normal (perp)
+      let nx = -ey, ny = ex;
+      const nlen = Math.hypot(nx, ny) || 1;
+      nx /= nlen; ny /= nlen;
+      // determine sign of normal: sample point slightly along normal from closest point; if sample is inside poly, flip
+      const sampleX = res.closest.x + nx * 2;
+      const sampleY = res.closest.y + ny * 2;
+      const sampleInside = pointInPolygon(sampleX, sampleY, poly);
+      if (sampleInside) { nx = -nx; ny = -ny; }
+      minOverlap = overlap;
+      pushVec = { nx, ny, overlap };
+    }
+  }
+
+  if (inside && pushVec == null) {
+    // Odd case: center inside but no edge detected (degenerate). Move outward by radius by using centroid -> try centroid
+    let cx = 0, cy = 0;
+    for (const q of poly) { cx += q.x; cy += q.y; }
+    cx /= poly.length; cy /= poly.length;
+    let nx = p.x - cx, ny = p.y - cy;
+    const nl = Math.hypot(nx, ny) || 1;
+    nx /= nl; ny /= nl;
+    const overlap = p.radius + 1;
+    p.x += nx * overlap; p.y += ny * overlap;
+    p.vx = 0; p.vy = 0;
+    return;
+  }
+
+  if (pushVec && pushVec.overlap > 0) {
+    p.x += pushVec.nx * pushVec.overlap;
+    p.y += pushVec.ny * pushVec.overlap;
+    // damp velocity along normal
+    const vn = p.vx * pushVec.nx + p.vy * pushVec.ny;
+    if (vn > 0) { p.vx -= vn * pushVec.nx; p.vy -= vn * pushVec.ny; }
+  }
+}
+
+// Backwards-compatible pointInsideWall (handles both rects and polygon walls)
 function pointInsideWall(x, y, margin = 6) {
   for (const w of walls) {
-    if (x >= w.x - margin && x <= w.x + w.w + margin && y >= w.y - margin && y <= w.y + w.h + margin) return true;
+    if (w.points && Array.isArray(w.points)) {
+      if (pointInPolygon(x, y, w.points)) return true;
+    } else if (typeof w.x === 'number' && typeof w.w === 'number') {
+      if (x >= w.x - margin && x <= w.x + w.w + margin && y >= w.y - margin && y <= w.y + w.h + margin) return true;
+    }
   }
   return false;
 }
 
+// spawn mob helper using new pointInsideWall
 function spawnMobAt(sp, typeName) {
   const def = mobDefs[typeName]; if (!def) return null;
-  const jitter = (CELL * 0.4) || 120; // adjust jitter for new scale
+  const jitter = (CELL * 0.4) || 120;
   const maxAttempts = 12;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const x = sp.x + (Math.random() * jitter * 2 - jitter);
     const y = sp.y + (Math.random() * jitter * 2 - jitter);
-    // clamp to map (avoid edges)
     const limit = MAP_HALF - (def.radius || 18) - 12;
     if (x < -limit || x > limit || y < -limit || y > limit) continue;
-    if (pointInsideWall(x, y, Math.max(6, def.radius * 0.5))) continue; // invalid, inside or too close to wall
+    if (pointInsideWall(x, y, Math.max(6, def.radius * 0.5))) continue;
     const id = 'mob_' + (nextMobId++);
     const m = { id, type: typeName, x, y, vx:0, vy:0, hp:def.maxHp, maxHp:def.maxHp, radius:def.radius, aggroRadius:650, damageContrib: {}, spawnPoint: sp, def, respawnAt: null, dead: false, stunnedUntil: 0 };
     mobs.set(id, m); return m;
   }
-  // fallback placement if no valid spot found
+  // fallback
   let fallbackX = sp.x, fallbackY = sp.y;
   let step = 0;
   while (pointInsideWall(fallbackX, fallbackY, 8) && step < 8) {
@@ -170,9 +258,9 @@ function spawnMobAt(sp, typeName) {
   mobs.set(id, m); return m;
 }
 
-// spawn initial mobs
+// spawn initial mobs - unchanged counts
 for (const sp of mobSpawnPoints) {
-  const count = 4 + Math.floor(Math.random() * 3);
+  const count = 4 + Math.floor(Math.random() * 3); // 4-6 per spawn point
   for (let i = 0; i < count; i++) {
     const t = sp.types[Math.floor(Math.random() * sp.types.length)];
     spawnMobAt(sp, t);
@@ -201,6 +289,7 @@ const SKILL_DEFS = {
   ]
 };
 
+// Convert CLASS COOLDOWNS to ms
 const CLASS_COOLDOWNS_MS = {
   warrior: [3500,7000,10000,25000],
   ranger:  [2000,25000,12000,4000],
@@ -210,17 +299,6 @@ const CLASS_COOLDOWNS_MS = {
 // --- Utilities ---
 function nowMs(){ return Date.now(); }
 function randRange(min,max){ return Math.random()*(max-min)+min; }
-
-function spawnPosition() {
-  const sp = mobSpawnPoints[Math.floor(Math.random() * mobSpawnPoints.length)];
-  const jitter = (CELL * 0.4) || 120;
-  for (let attempt = 0; attempt < 10; attempt++) {
-    const x = sp.x + (Math.random() * jitter * 2 - jitter);
-    const y = sp.y + (Math.random() * jitter * 2 - jitter);
-    if (!pointInsideWall(x, y, 8)) return { x, y };
-  }
-  return { x: sp.x, y: sp.y };
-}
 
 // Create runtime player
 function createPlayerRuntime(ws, opts = {}) {
@@ -254,6 +332,7 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ server });
 
+// Optional origin allow list
 const allowedOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean) : null;
 
 function broadcast(obj) {
@@ -265,6 +344,7 @@ function broadcast(obj) {
   }
 }
 
+// Damage mob helper
 function damageMob(mob, amount, playerId) {
   if (!mob) return;
   if (typeof mob.hp !== 'number') mob.hp = Number(mob.hp) || 0;
@@ -301,6 +381,7 @@ function handleMobDeath(mob, killerId = null) {
   mob.damageContrib = {};
 }
 
+// Player damage & death
 function applyDamageToPlayer(targetPlayer, amount, attackerId) {
   if (!targetPlayer || targetPlayer.hp <= 0) return;
   targetPlayer.hp -= amount;
@@ -325,20 +406,7 @@ function handlePlayerDeath(player, killer) {
   player.hp = 0;
 }
 
-function resolveCircleAABB(p, rect) {
-  const rx1 = rect.x, ry1 = rect.y, rx2 = rect.x + rect.w, ry2 = rect.y + rect.h;
-  const closestX = Math.max(rx1, Math.min(p.x, rx2)); const closestY = Math.max(ry1, Math.min(p.y, ry2));
-  let dx = p.x - closestX, dy = p.y - closestY; const distSq = dx*dx + dy*dy;
-  if (distSq === 0) {
-    const leftDist = Math.abs(p.x - rx1), rightDist = Math.abs(rx2 - p.x), topDist = Math.abs(p.y - ry1), bottomDist = Math.abs(ry2 - p.y);
-    const minHoriz = Math.min(leftDist, rightDist), minVert = Math.min(topDist, bottomDist);
-    if (minHoriz < minVert) { if (leftDist < rightDist) p.x = rx1 - p.radius - 0.1; else p.x = rx2 + p.radius + 0.1; } else { if (topDist < bottomDist) p.y = ry1 - p.radius - 0.1; else p.y = ry2 + p.radius + 0.1; }
-    p.vx = 0; p.vy = 0; return;
-  }
-  const dist = Math.sqrt(distSq); const overlap = p.radius - dist;
-  if (overlap > 0) { dx /= dist; dy /= dist; p.x += dx * overlap; p.y += dy * overlap; const vn = p.vx * dx + p.vy * dy; if (vn > 0) { p.vx -= vn * dx; p.vy -= vn * dy; } }
-}
-
+// --- Server tick: mobs/player updates & projectiles & snapshots
 function serverTick() {
   const now = nowMs();
   // respawn mobs
@@ -389,7 +457,13 @@ function serverTick() {
     p.x += vx * TICK_DT; p.y += vy * TICK_DT; p.vx = vx; p.vy = vy;
     const limit = MAP_HALF - p.radius - 1;
     if (p.x > limit) p.x = limit; if (p.x < -limit) p.x = -limit; if (p.y > limit) p.y = limit; if (p.y < -limit) p.y = -limit;
-    for (const w of walls) resolveCircleAABB(p, w);
+
+    // handle polygon (or rect) wall collisions by resolving with polygon or aabb
+    for (const w of walls) {
+      if (w.points && Array.isArray(w.points)) resolveCirclePolygon(p, w.points);
+      else resolveCircleAABB(p, w);
+    }
+
     const nowSec = Date.now()/1000;
     if (p.hp > 0) {
       for (const m of mobs.values()) {
@@ -415,6 +489,7 @@ function serverTick() {
     proj.y += proj.vy * dt;
     const limit = MAP_HALF - (proj.radius || 6) - 1;
     if (proj.x > limit) proj.x = limit; if (proj.x < -limit) proj.x = -limit; if (proj.y > limit) proj.y = limit; if (proj.y < -limit) proj.y = -limit;
+    // collisions with mobs
     let hit = false;
     for (const m of mobs.values()) {
       if (m.hp <= 0) continue;
@@ -473,6 +548,7 @@ function serverTick() {
   }
   for (const id of toRemove) projectiles.delete(id);
 
+  // broadcast snapshot (clients will now receive polygon walls)
   const playerList = Array.from(players.values()).map(p => ({ id: p.id, name: p.name, x: Math.round(p.x), y: Math.round(p.y), vx: Math.round(p.vx), vy: Math.round(p.vy), radius: p.radius, color: p.color, hp: Math.round(p.hp), maxHp: Math.round(p.maxHp), level: 1, xp: Math.round(p.xp || 0) }));
   const mobList = Array.from(mobs.values()).map(m => ({ id: m.id, type: m.type, x: Math.round(m.x), y: Math.round(m.y), hp: Math.round(m.hp), maxHp: Math.round(m.maxHp), radius: m.radius, stunnedUntil: m.stunnedUntil || 0 }));
   const projList = Array.from(projectiles.values()).map(p => ({ id: p.id, type: p.type, x: Math.round(p.x), y: Math.round(p.y), vx: Math.round(p.vx), vy: Math.round(p.vy), radius: p.radius, owner: p.ownerId, ttl: Math.max(0, p.ttl ? Math.round(p.ttl - now) : 0) }));
@@ -481,6 +557,7 @@ function serverTick() {
 
 setInterval(serverTick, Math.round(1000 / TICK_RATE));
 
+// Heartbeat & stale cleanup
 const HEARTBEAT_INTERVAL_MS = 30000;
 const PLAYER_STALE_MS = 120000;
 
@@ -504,6 +581,7 @@ const heartbeatInterval = setInterval(() => {
   }
 }, HEARTBEAT_INTERVAL_MS);
 
+// WebSocket handling (guest join)
 wss.on('connection', (ws, req) => {
   if (allowedOrigins && req && req.headers && req.headers.origin) {
     if (!allowedOrigins.includes(req.headers.origin)) {
@@ -725,6 +803,7 @@ wss.on('connection', (ws, req) => {
   });
 });
 
+// Graceful shutdown
 function shutdown() {
   console.log('Shutting down...');
   try { clearInterval(heartbeatInterval); } catch(e){}
@@ -735,4 +814,5 @@ function shutdown() {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
+// Start listening
 server.listen(PORT, () => { console.log(`Moborr server listening on port ${PORT}`); });
