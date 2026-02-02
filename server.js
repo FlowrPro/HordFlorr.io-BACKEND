@@ -2,8 +2,6 @@
 // Run: node server.js
 // Environment:
 //  - PORT (optional)
-//  - ALLOWED_ORIGINS (optional, comma-separated list of allowed origins for WebSocket upgrades)
-//
 // NOTE: This server intentionally contains no registration/signup/auth code — it accepts guest joins only.
 
 const http = require('http');
@@ -34,7 +32,6 @@ const projectiles = new Map();
 let nextProjId = 1;
 
 // --- Map walls (12x12 grid scaled) ---
-// Keep the box/row helpers so it's easy to author map pieces in cell coordinates.
 const CELL = MAP_SIZE / 12;
 const GAP = 40;
 function h(col, row, lenCells, id) { return { id: id || `h_${col}_${row}_${lenCells}`, x: -MAP_HALF + (col - 1) * CELL + GAP, y: -MAP_HALF + (row - 1) * CELL + GAP, w: Math.max(1, lenCells) * CELL - GAP * 2, h: WALL_THICKNESS }; }
@@ -43,21 +40,16 @@ function box(col, row, wCells, hCells, id) { return { id: id || `box_${col}_${ro
 
 // --- Open Plains with Scattered Cover ---
 const walls = [
-  // small isolated rocks / cover
   box(2, 3, 1, 1, 'rock_1'),
   box(4, 6, 1, 1, 'rock_2'),
   box(6, 9, 1, 1, 'rock_3'),
   box(9, 4, 1, 1, 'rock_4'),
   box(11, 8, 1, 1, 'rock_5'),
-
-  // slightly larger cover patches
   box(3, 10, 2, 1, 'cover_6'),
   box(7, 2, 1, 2, 'cover_7'),
   box(5, 5, 2, 2, 'cover_center_small'),
   box(10, 10, 1, 1, 'rock_8'),
   box(8, 7, 1, 1, 'rock_9'),
-
-  // some long low cover strips (small buildings / hedges)
   box(2, 8, 1, 2, 'cover_10'),
   box(6, 4, 2, 1, 'cover_11')
 ];
@@ -76,12 +68,10 @@ const mobSpawnPoints = [
   { x: -MAP_HALF + CELL * 10 + CELL/2, y: -MAP_HALF + CELL*3 + CELL/2, types: ['goblin','slime','boar'] },
   { x: -MAP_HALF + CELL * 3 + CELL/2, y: -MAP_HALF + CELL*9 + CELL/2, types: ['slime','goblin','boar'] },
   { x: -MAP_HALF + CELL * 9 + CELL/2, y: -MAP_HALF + CELL*8 + CELL/2, types: ['wolf','goblin','boar'] },
-  // Add extra spawn points for more coverage
   { x: -MAP_HALF + CELL * 5 + CELL/2, y: -MAP_HALF + CELL*2 + CELL/2, types: ['slime','goblin'] },
   { x: -MAP_HALF + CELL * 2 + CELL/2, y: -MAP_HALF + CELL*8 + CELL/2, types: ['goblin','wolf'] }
 ];
 
-// check if a point is inside any wall (with a safety margin)
 function pointInsideWall(x, y, margin = 6) {
   for (const w of walls) {
     if (x >= w.x - margin && x <= w.x + w.w + margin && y >= w.y - margin && y <= w.y + w.h + margin) return true;
@@ -96,15 +86,14 @@ function spawnMobAt(sp, typeName) {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const x = sp.x + (Math.random() * jitter * 2 - jitter);
     const y = sp.y + (Math.random() * jitter * 2 - jitter);
-    // clamp to map (avoid edges)
     const limit = MAP_HALF - (def.radius || 18) - 12;
     if (x < -limit || x > limit || y < -limit || y > limit) continue;
-    if (pointInsideWall(x, y, 8)) continue; // invalid, inside or too close to wall
+    if (pointInsideWall(x, y, 8)) continue;
     const id = 'mob_' + (nextMobId++);
-    const m = { id, type: typeName, x, y, vx:0, vy:0, hp:def.maxHp, maxHp:def.maxHp, radius:def.radius, aggroRadius:650, damageContrib: {}, spawnPoint: sp, def, respawnAt: null, dead: false };
+    const m = { id, type: typeName, x, y, vx:0, vy:0, hp:def.maxHp, maxHp:def.maxHp, radius:def.radius, aggroRadius:650, damageContrib: {}, spawnPoint: sp, def, respawnAt: null, dead: false, stunnedUntil: 0 };
     mobs.set(id, m); return m;
   }
-  // if no valid spot found, place at spawn point fallback (but offset outward until not in wall)
+  // fallback outward placement
   let fallbackX = sp.x, fallbackY = sp.y;
   let step = 0;
   while (pointInsideWall(fallbackX, fallbackY, 8) && step < 8) {
@@ -113,57 +102,66 @@ function spawnMobAt(sp, typeName) {
     step++;
   }
   const id = 'mob_' + (nextMobId++);
-  const m = { id, type: typeName, x: fallbackX, y: fallbackY, vx:0, vy:0, hp:def.maxHp, maxHp:def.maxHp, radius:def.radius, aggroRadius:650, damageContrib: {}, spawnPoint: sp, def, respawnAt: null, dead: false };
+  const m = { id, type: typeName, x: fallbackX, y: fallbackY, vx:0, vy:0, hp:def.maxHp, maxHp:def.maxHp, radius:def.radius, aggroRadius:650, damageContrib: {}, spawnPoint: sp, def, respawnAt: null, dead: false, stunnedUntil: 0 };
   mobs.set(id, m); return m;
 }
 
-// spawn initial mobs - increase density (but not excessive)
+// initial spawn
 for (const sp of mobSpawnPoints) {
-  const count = 4 + Math.floor(Math.random() * 3); // 4-6 per spawn point
+  const count = 4 + Math.floor(Math.random() * 3); // 4-6
   for (let i = 0; i < count; i++) {
     const t = sp.types[Math.floor(Math.random() * sp.types.length)];
     spawnMobAt(sp, t);
   }
 }
 
-// --- Abilities / Skill definitions (server-side authoritative)
+// --- Abilities (server authoritative) ---
 const SKILL_DEFS = {
+  // warrior: slash (melee), shieldbash (stun), charge (speed buff 1.5x), rage (damage buff 1.15x)
   warrior: [
     { kind: 'melee', damage: 60, range: 48, ttl: 0, type: 'slash' },
-    { kind: 'aoe', damage: 40, radius: 48, ttl: 0, type: 'shieldbash' },
-    { kind: 'aoe', damage: 50, radius: 80, ttl: 0, type: 'charge', buff: { type: 'speed', multiplier: 2, durationMs: 5000 } },
-    { kind: 'aoe', damage: 120, radius: 90, ttl: 0, type: 'rage' }
+    { kind: 'aoe_stun', damage: 40, radius: 48, ttl: 0, type: 'shieldbash', stunMs: 3000 },
+    { kind: 'aoe', damage: 10, radius: 80, ttl: 0, type: 'charge', buff: { type: 'speed', multiplier: 1.5, durationMs: 5000 } },
+    { kind: 'buff', damage: 0, radius: 0, ttl: 0, type: 'rage', buff: { type: 'damage', multiplier: 1.15, durationMs: 10000 } }
   ],
+
+  // ranger: shot (target), rapid (5 arrows, nerfed per-arrow damage), trap (stun projectile), snipe (target: 3x damage)
   ranger: [
-    { kind: 'proj', damage: 40, speed: 680, radius: 6, ttlMs: 3000, type: 'arrow' },
-    { kind: 'proj', damage: 30, speed: 720, radius: 5, ttlMs: 2500, type: 'rapid' },
-    { kind: 'proj', damage: 12, speed: 380, radius: 8, ttlMs: 1600, type: 'trap' },
-    { kind: 'proj', damage: 85, speed: 880, radius: 7, ttlMs: 3500, type: 'snipe' }
+    { kind: 'proj_target', damage: 40, speed: 680, radius: 6, ttlMs: 3000, type: 'arrow' }, // shot
+    { kind: 'proj_burst', damage: 20, speed: 720, radius: 5, ttlMs: 2500, type: 'rapid', count: 5, spreadDeg: 12 }, // rapid fire: 5 arrows at 20 dmg
+    { kind: 'proj_target_stun', damage: 12, speed: 380, radius: 8, ttlMs: 1600, type: 'trap', stunMs: 3000 }, // trap stuns
+    { kind: 'proj_target', damage: 120, speed: 880, radius: 7, ttlMs: 3500, type: 'snipe' } // snipe ~ 3x of shot (40*3=120)
   ],
+
+  // mage: spark (target), fireball (target heavy), frostnova (target stun), arcane (area multi-shot)
   mage: [
-    { kind: 'proj', damage: 45, speed: 420, radius: 10, ttlMs: 3000, type: 'spark' },
-    { kind: 'proj_explode', damage: 70, speed: 360, radius: 10, ttlMs: 3000, explodeRadius: 90, type: 'fireball' },
-    { kind: 'aoe', damage: 60, radius: 120, ttl: 0, type: 'frostnova' },
-    { kind: 'proj', damage: 120, speed: 520, radius: 12, ttlMs: 3200, type: 'arcane' }
+    { kind: 'proj_target', damage: 45, speed: 420, radius: 10, ttlMs: 3000, type: 'spark' },
+    { kind: 'proj_target', damage: 135, speed: 360, radius: 10, ttlMs: 3000, type: 'fireball' }, // 3x spark
+    { kind: 'proj_target_stun', damage: 60, speed: 0, radius: 0, ttlMs: 0, type: 'frostnova', stunMs: 3000 }, // frostnova: target stun (no projectile)
+    { kind: 'proj_aoe_spread', damage: 45, speed: 520, radius: 12, ttlMs: 3200, type: 'arcane', count: 6, spreadDeg: 45 } // arcane: multi-shot to point
   ]
 };
 
-// Convert CLASS COOLDOWNS to ms
+// cooldowns (seconds)
+const CLASS_COOLDOWNS = {
+  warrior: [3.5, 7.0, 10.0, 25.0],
+  ranger:  [2.0, 25.0, 12.0, 4.0], // shot 2s, rapid 25s, trap 12s, snipe 4s
+  mage:    [2.5, 5.0, 25.0, 10.0]  // fireball cd doubled vs spark: spark 2.5 -> fireball 5.0; frostnova 25s; arcane 10s
+};
+
 const CLASS_COOLDOWNS_MS = {
-  warrior: [3500,7000,10000,25000],
-  ranger:  [2000,6000,12000,18000],
-  mage:    [2500,6500,9000,22000]
+  warrior: CLASS_COOLDOWNS.warrior.map(v => Math.round(v*1000)),
+  ranger:  CLASS_COOLDOWNS.ranger.map(v => Math.round(v*1000)),
+  mage:    CLASS_COOLDOWNS.mage.map(v => Math.round(v*1000))
 };
 
 // --- Utilities ---
 function nowMs(){ return Date.now(); }
 function randRange(min,max){ return Math.random()*(max-min)+min; }
 
-// Spawn position (choose a spawn point area)
 function spawnPosition() {
   const sp = mobSpawnPoints[Math.floor(Math.random() * mobSpawnPoints.length)];
   const jitter = 120;
-  // try to find a free spot near the spawn point
   for (let attempt = 0; attempt < 10; attempt++) {
     const x = sp.x + (Math.random() * jitter * 2 - jitter);
     const y = sp.y + (Math.random() * jitter * 2 - jitter);
@@ -172,7 +170,6 @@ function spawnPosition() {
   return { x: sp.x, y: sp.y };
 }
 
-// Create runtime player. If fixedId is provided, use that as player's id.
 function createPlayerRuntime(ws, opts = {}) {
   const fixedId = opts.id || null;
   const id = fixedId ? String(fixedId) : String(nextPlayerId++);
@@ -185,15 +182,16 @@ function createPlayerRuntime(ws, opts = {}) {
     maxHp: 200, hp: 200, xp: 0, gold: 0,
     lastAttackTime: 0, attackCooldown: 0.6, baseDamage: 18, invulnerableUntil: 0,
     class: opts.class || 'warrior',
-    cooldowns: {}, // slot cooldown timestamps (ms) keyed by slot index 1..4
+    cooldowns: {},
     baseSpeed: 380,
-    buffs: [] // array of { type, until(ms), multiplier }
+    buffs: [], // { type, until(ms), multiplier }
+    stunnedUntil: 0
   };
   players.set(String(p.id), p);
   return p;
 }
 
-// --- HTTP server (status + nothing else) ---
+// --- HTTP server ---
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end('Moborr.io server running\n'); return;
@@ -202,9 +200,6 @@ const server = http.createServer((req, res) => {
 });
 
 const wss = new WebSocket.Server({ server });
-
-// Optional origin allow list (comma-separated env var)
-const allowedOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean) : null;
 
 // Broadcast helper
 function broadcast(obj) {
@@ -216,21 +211,20 @@ function broadcast(obj) {
   }
 }
 
-// Damage mob helper - robust and ensures death handled once
+// --- Damage & death helpers ---
 function damageMob(mob, amount, playerId) {
   if (!mob) return;
   if (typeof mob.hp !== 'number') mob.hp = Number(mob.hp) || 0;
-  if (mob.hp <= 0) return; // already dead
+  if (mob.hp <= 0) return;
   mob.hp -= amount;
   if (playerId) { mob.damageContrib[playerId] = (mob.damageContrib[playerId] || 0) + amount; }
   if (mob.hp <= 0) {
-    // ensure death handled once
     if (!mob.respawnAt) handleMobDeath(mob, playerId);
   }
 }
 function handleMobDeath(mob, killerId = null) {
   if (!mob) return;
-  if (mob.respawnAt) return; // already processed
+  if (mob.respawnAt) return;
   let topId = killerId || null;
   let topDmg = 0;
   for (const pid in mob.damageContrib) {
@@ -254,16 +248,14 @@ function handleMobDeath(mob, killerId = null) {
   mob.damageContrib = {};
 }
 
-// Player damage & death
+// player damage & death
 function applyDamageToPlayer(targetPlayer, amount, attackerId) {
   if (!targetPlayer || targetPlayer.hp <= 0) return;
   targetPlayer.hp -= amount;
   if (targetPlayer.hp <= 0) {
     handlePlayerDeath(targetPlayer, attackerId ? { id: attackerId } : null);
-    // broadcast player death
     broadcast({ t: 'player_died', id: targetPlayer.id, killerId: attackerId || null });
   } else {
-    // broadcast damage event (clients can play hit effects)
     broadcast({ t: 'player_hurt', id: targetPlayer.id, hp: Math.round(targetPlayer.hp), source: attackerId || null });
   }
 }
@@ -281,7 +273,7 @@ function handlePlayerDeath(player, killer) {
   player.hp = 0;
 }
 
-// --- Collision push (server)
+// collision push
 function resolveCircleAABB(p, rect) {
   const rx1 = rect.x, ry1 = rect.y, rx2 = rect.x + rect.w, ry2 = rect.y + rect.h;
   const closestX = Math.max(rx1, Math.min(p.x, rx2)); const closestY = Math.max(ry1, Math.min(p.y, ry2));
@@ -296,7 +288,7 @@ function resolveCircleAABB(p, rect) {
   if (overlap > 0) { dx /= dist; dy /= dist; p.x += dx * overlap; p.y += dy * overlap; const vn = p.vx * dx + p.vy * dy; if (vn > 0) { p.vx -= vn * dx; p.vy -= vn * dy; } }
 }
 
-// --- Server tick: mobs/player updates & projectiles & snapshots
+// --- Server tick ---
 function serverTick() {
   const now = nowMs();
   // respawn mobs
@@ -309,6 +301,11 @@ function serverTick() {
   // update mobs
   for (const m of mobs.values()) {
     if (m.hp <= 0) continue;
+    if (m.stunnedUntil && now < m.stunnedUntil) {
+      // stunned: do not move or act
+      m.vx *= 0.8; m.vy *= 0.8;
+      continue;
+    }
     let target = null, bestD = Infinity;
     for (const p of players.values()) { if (p.hp <= 0) continue; const d = Math.hypot(m.x - p.x, m.y - p.y); if (d < m.aggroRadius && d < bestD) { bestD = d; target = p; } }
     if (target) {
@@ -328,7 +325,18 @@ function serverTick() {
     const nowMsVal = nowMs();
     p.buffs = (p.buffs || []).filter(b => b.until > nowMsVal);
     let speedMultiplier = 1.0;
-    for (const b of p.buffs) speedMultiplier *= (b.multiplier || 1.0);
+    let damageMultiplier = 1.0;
+    for (const b of p.buffs) {
+      speedMultiplier *= (b.multiplier || 1.0);
+      if (b.type === 'damage') damageMultiplier *= (b.multiplier || 1.0);
+    }
+
+    // if stunned, skip movement & attacks
+    if (p.stunnedUntil && nowMsVal < p.stunnedUntil) {
+      p.vx = 0; p.vy = 0;
+      p.lastSeen = now;
+      continue;
+    }
 
     const inVec = p.lastInput || { x:0, y:0 }; const speed = (p.baseSpeed || 380) * speedMultiplier; const vx = inVec.x * speed, vy = inVec.y * speed;
     p.x += vx * TICK_DT; p.y += vy * TICK_DT; p.vx = vx; p.vy = vy;
@@ -339,9 +347,14 @@ function serverTick() {
     if (p.hp > 0) {
       for (const m of mobs.values()) {
         if (m.hp <= 0) continue;
+        // respect mob stun status when checking range and attacks (m won't damage if stunned)
         const d = Math.hypot(m.x - p.x, m.y - p.y); const range = p.radius + m.radius + 8;
         if (d <= range) {
-          if (nowSec - (p.lastAttackTime || 0) >= p.attackCooldown) { p.lastAttackTime = nowSec; const dmg = p.baseDamage; damageMob(m, dmg, p.id); }
+          if (nowSec - (p.lastAttackTime || 0) >= p.attackCooldown) {
+            p.lastAttackTime = nowSec;
+            let dmg = p.baseDamage * (damageMultiplier || 1.0);
+            damageMob(m, dmg, p.id);
+          }
         }
       }
     } else {
@@ -356,19 +369,25 @@ function serverTick() {
     const dt = TICK_DT;
     if (!proj) continue;
     if (proj.ttl && now >= proj.ttl) { toRemove.push(id); continue; }
+
     // move
     proj.x += proj.vx * dt;
     proj.y += proj.vy * dt;
+
     // clamp to map
     const limit = MAP_HALF - (proj.radius || 6) - 1;
     if (proj.x > limit) proj.x = limit; if (proj.x < -limit) proj.x = -limit; if (proj.y > limit) proj.y = limit; if (proj.y < -limit) proj.y = -limit;
+
     // collisions with mobs
     let hit = false;
     for (const m of mobs.values()) {
       if (m.hp <= 0) continue;
+      if (m.stunnedUntil && now < m.stunnedUntil) {
+        // still stunned but can be hit
+      }
       const d = Math.hypot(proj.x - m.x, proj.y - m.y);
       if (d <= ((proj.radius || 6) + (m.radius || 12))) {
-        // If projectile explodes, do AoE damage
+        // explosion or special handling
         if (proj.kind === 'proj_explode' && proj.explodeRadius && proj.explodeRadius > 0) {
           for (const m2 of mobs.values()) {
             if (m2.hp <= 0) continue;
@@ -380,18 +399,23 @@ function serverTick() {
         } else {
           damageMob(m, proj.damage, proj.ownerId);
         }
+        // apply stun if projectile has stunMs
+        if (proj.stunMs) {
+          m.stunnedUntil = now + proj.stunMs;
+          broadcast({ t: 'stun', id: m.id, kind: 'mob', until: m.stunnedUntil, sourceId: proj.ownerId });
+        }
         hit = true; break;
       }
     }
     if (hit) { toRemove.push(id); continue; }
+
     // collisions with players (PvP)
     for (const p of players.values()) {
-      if (String(p.id) === String(proj.ownerId)) continue; // don't hit owner
+      if (String(p.id) === String(proj.ownerId)) continue;
       if (p.hp <= 0) continue;
       const d = Math.hypot(proj.x - p.x, proj.y - p.y);
       if (d <= ((proj.radius || 6) + (p.radius || 12))) {
         if (proj.kind === 'proj_explode' && proj.explodeRadius && proj.explodeRadius > 0) {
-          // AoE damage to nearby players and mobs
           for (const p2 of players.values()) {
             if (p2.hp <= 0) continue;
             const d2 = Math.hypot(proj.x - p2.x, proj.y - p2.y);
@@ -399,15 +423,12 @@ function serverTick() {
               applyDamageToPlayer(p2, proj.damage, proj.ownerId);
             }
           }
-          for (const m2 of mobs.values()) {
-            if (m2.hp <= 0) continue;
-            const d2 = Math.hypot(proj.x - m2.x, proj.y - m2.y);
-            if (d2 <= proj.explodeRadius + (m2.radius || 12)) {
-              damageMob(m2, proj.damage, proj.ownerId);
-            }
-          }
         } else {
           applyDamageToPlayer(p, proj.damage, proj.ownerId);
+        }
+        if (proj.stunMs) {
+          p.stunnedUntil = now + proj.stunMs;
+          broadcast({ t: 'stun', id: p.id, kind: 'player', until: p.stunnedUntil, sourceId: proj.ownerId });
         }
         hit = true; break;
       }
@@ -416,19 +437,18 @@ function serverTick() {
   }
   for (const id of toRemove) projectiles.delete(id);
 
-  // broadcast snapshot (now includes xp so clients stay authoritative)
+  // broadcast snapshot (include xp)
   const playerList = Array.from(players.values()).map(p => ({ id: p.id, name: p.name, x: Math.round(p.x), y: Math.round(p.y), vx: Math.round(p.vx), vy: Math.round(p.vy), radius: p.radius, color: p.color, hp: Math.round(p.hp), maxHp: Math.round(p.maxHp), level: 1, xp: Math.round(p.xp || 0) }));
-  const mobList = Array.from(mobs.values()).map(m => ({ id: m.id, type: m.type, x: Math.round(m.x), y: Math.round(m.y), hp: Math.round(m.hp), maxHp: Math.round(m.maxHp), radius: m.radius }));
+  const mobList = Array.from(mobs.values()).map(m => ({ id: m.id, type: m.type, x: Math.round(m.x), y: Math.round(m.y), hp: Math.round(m.hp), maxHp: Math.round(m.maxHp), radius: m.radius, stunnedUntil: m.stunnedUntil || 0 }));
   const projList = Array.from(projectiles.values()).map(p => ({ id: p.id, type: p.type, x: Math.round(p.x), y: Math.round(p.y), vx: Math.round(p.vx), vy: Math.round(p.vy), radius: p.radius, owner: p.ownerId, ttl: Math.max(0, p.ttl ? Math.round(p.ttl - now) : 0) }));
   broadcast({ t:'snapshot', tick: nowMs(), players: playerList, mobs: mobList, projectiles: projList });
 }
 
 setInterval(serverTick, Math.round(1000 / TICK_RATE));
 
-// --- Heartbeat and stale-player cleanup ---
+// --- Heartbeat / cleanup ---
 const HEARTBEAT_INTERVAL_MS = 30000;
-const PLAYER_STALE_MS = 120000; // 2 minutes
-
+const PLAYER_STALE_MS = 120000;
 const heartbeatInterval = setInterval(() => {
   const now = Date.now();
   wss.clients.forEach((ws) => {
@@ -440,7 +460,6 @@ const heartbeatInterval = setInterval(() => {
     try { ws.ping(() => {}); } catch (e) {}
   });
 
-  // sweep stale players (in case connections dropped silently)
   for (const [id, p] of players.entries()) {
     if (now - (p.lastSeen || 0) > PLAYER_STALE_MS) {
       if (p.ws && p.ws.terminate) try { p.ws.terminate(); } catch (e) {}
@@ -450,17 +469,8 @@ const heartbeatInterval = setInterval(() => {
   }
 }, HEARTBEAT_INTERVAL_MS);
 
-// --- WebSocket handling (guest join only) ---
+// --- WebSocket handling ---
 wss.on('connection', (ws, req) => {
-  // Optional origin check
-  if (allowedOrigins && req && req.headers && req.headers.origin) {
-    if (!allowedOrigins.includes(req.headers.origin)) {
-      console.log('Rejecting connection from origin', req.headers.origin);
-      try { ws.close(1008, 'Origin not allowed'); } catch (e) {}
-      return;
-    }
-  }
-
   console.log('connection from', req.socket.remoteAddress);
   ws.isAlive = true;
   ws.on('pong', () => ws.isAlive = true);
@@ -474,7 +484,6 @@ wss.on('connection', (ws, req) => {
       if (!msg || !msg.t) return;
 
       if (!ws.authenticated) {
-        // Only accept guest join flow - create runtime player with numeric id
         if (msg.t === 'join') {
           const name = (msg.name && String(msg.name).slice(0,24)) || ('Player' + (nextPlayerId++));
           const p = createPlayerRuntime(ws, { name, class: (msg.class || 'warrior') });
@@ -487,11 +496,13 @@ wss.on('connection', (ws, req) => {
         }
       }
 
-      // Authenticated: handle gameplay messages
       const player = players.get(String(ws.playerId));
       if (!player) return;
 
       if (msg.t === 'input') {
+        // ignore inputs while stunned
+        const now = Date.now();
+        if (player.stunnedUntil && now < player.stunnedUntil) { player.lastInput = { x:0, y:0 }; return; }
         const input = msg.input;
         if (input && typeof input.x === 'number' && typeof input.y === 'number') {
           let x = Number(input.x), y = Number(input.y);
@@ -510,102 +521,176 @@ wss.on('connection', (ws, req) => {
       } else if (msg.t === 'ping') {
         try { ws.send(JSON.stringify({ t: 'pong', ts: msg.ts || Date.now() })); } catch(e){}
       } else if (msg.t === 'cast') {
-        // Server-side authoritative cast handling
+        // CAST HANDLER: supports targeted and non-targeted skills
         const slot = Math.max(1, Math.min(4, Number(msg.slot || 1)));
         const cls = String(msg.class || player.class || 'warrior');
         const now = Date.now();
-        // cooldown check
         player.cooldowns = player.cooldowns || {};
         const cdKey = `s${slot}`;
         const cooldowns = CLASS_COOLDOWNS_MS[cls] || [6000,6000,6000,6000];
         const cdUntil = player.cooldowns[cdKey] || 0;
         if (now < cdUntil) {
-          // still cooling, ignore
           try { ws.send(JSON.stringify({ t:'cast_rejected', reason:'cooldown', slot })); } catch(e){}
           return;
         }
-        // basic validation: alive
         if (player.hp <= 0) return;
-        // get skill def
         const defs = SKILL_DEFS[cls] || SKILL_DEFS['warrior'];
         const def = defs[Math.max(0, Math.min(slot-1, defs.length-1))];
         if (!def) return;
-        // set cooldown
         const cdMs = cooldowns[Math.max(0, slot-1)] || 6000;
         player.cooldowns[cdKey] = now + cdMs;
 
-        // get angle from client if present (validate)
-        let angle = 0;
-        if (typeof msg.angle === 'number' && isFinite(msg.angle)) angle = Number(msg.angle);
+        // optional targetId or point (aimX/aimY)
+        const targetId = (typeof msg.targetId !== 'undefined') ? String(msg.targetId) : null;
+        const aimX = (typeof msg.aimX === 'number') ? Number(msg.aimX) : null;
+        const aimY = (typeof msg.aimY === 'number') ? Number(msg.aimY) : null;
 
-        if (def.kind === 'aoe') {
-          // immediate aoe centered on player
+        // helper: compute caster damage multiplier
+        let casterDamageMul = 1.0;
+        if (player.buffs && player.buffs.length) {
+          for (const b of player.buffs) if (b.type === 'damage' && b.until > now) casterDamageMul *= (b.multiplier || 1);
+        }
+
+        // Handle kinds
+        if (def.kind === 'aoe_stun') {
+          // immediate aoe stun centered on player
           const ax = player.x, ay = player.y;
-          // damage mobs
           for (const m of mobs.values()) {
             if (m.hp <= 0) continue;
             const d = Math.hypot(m.x - ax, m.y - ay);
-            if (d <= def.radius + (m.radius || 12)) damageMob(m, def.damage, player.id);
+            if (d <= def.radius + (m.radius || 12)) {
+              damageMob(m, def.damage, player.id);
+              m.stunnedUntil = now + (def.stunMs || 3000);
+              broadcast({ t:'stun', id: m.id, kind: 'mob', until: m.stunnedUntil, sourceId: player.id });
+            }
           }
-          // damage players (PvP)
           for (const p of players.values()) {
             if (String(p.id) === String(player.id)) continue;
             if (p.hp <= 0) continue;
             const d = Math.hypot(p.x - ax, p.y - ay);
-            if (d <= def.radius + (p.radius || 12)) applyDamageToPlayer(p, def.damage, player.id);
+            if (d <= def.radius + (p.radius || 12)) {
+              applyDamageToPlayer(p, def.damage, player.id);
+              p.stunnedUntil = now + (def.stunMs || 3000);
+              broadcast({ t:'stun', id: p.id, kind: 'player', until: p.stunnedUntil, sourceId: player.id });
+            }
           }
-
-          // apply buff for Charge (if defined)
-          let buffInfo = null;
-          if (def.type === 'charge' && def.buff) {
-            const b = def.buff;
-            player.buffs = player.buffs || [];
-            player.buffs.push({ type: b.type, until: now + (b.durationMs || 0), multiplier: b.multiplier || 1.0 });
-            buffInfo = { type: b.type, multiplier: b.multiplier, durationMs: b.durationMs };
-          }
-
-          // notify clients of cast effect (clients can show VFX)
-          broadcast({ t: 'cast_effect', casterId: player.id, casterName: player.name, type: def.type || 'aoe', skill: def.type || 'aoe', x: Math.round(ax), y: Math.round(ay), radius: def.radius, damage: def.damage, buff: buffInfo });
+          broadcast({ t: 'cast_effect', casterId: player.id, casterName: player.name, type: def.type, skill: def.type, x: Math.round(ax), y: Math.round(ay), radius: def.radius, damage: def.damage });
         } else if (def.kind === 'melee') {
-          // single-target melee: find nearest mob within range and damage it; otherwise damage players
           const range = def.range || 48;
-          let closest = null;
-          let closestD = Infinity;
+          let closest = null, closestD = Infinity;
           for (const m of mobs.values()) {
             if (m.hp <= 0) continue;
             const d = Math.hypot(m.x - player.x, m.y - player.y);
             if (d <= range + (m.radius || 12) && d < closestD) { closestD = d; closest = m; }
           }
-          let targetId = null;
           if (closest) {
-            damageMob(closest, def.damage, player.id);
-            targetId = closest.id;
+            damageMob(closest, def.damage * casterDamageMul, player.id);
+            broadcast({ t:'cast_effect', casterId: player.id, casterName: player.name, type: def.type, skill: def.type, x: Math.round(player.x), y: Math.round(player.y), range, damage: def.damage });
           } else {
-            // try hitting other players (PvP)
             for (const p2 of players.values()) {
               if (String(p2.id) === String(player.id)) continue;
               if (p2.hp <= 0) continue;
               const d = Math.hypot(p2.x - player.x, p2.y - player.y);
-              if (d <= range + (p2.radius || 12) && d < closestD) { closestD = d; closest = p2; }
+              if (d <= range + (p2.radius||12) && d < closestD) { closestD = d; closest = p2; }
             }
             if (closest && closest.id) {
-              applyDamageToPlayer(closest, def.damage, player.id);
-              targetId = closest.id;
+              applyDamageToPlayer(closest, def.damage * casterDamageMul, player.id);
+              broadcast({ t:'cast_effect', casterId: player.id, casterName: player.name, type: def.type, skill: def.type, x: Math.round(player.x), y: Math.round(player.y), range, damage: def.damage });
             }
           }
-          // broadcast melee effect (clients can show hit / short VFX)
-          broadcast({ t: 'cast_effect', casterId: player.id, casterName: player.name, type: def.type || 'melee', skill: def.type || 'melee', x: Math.round(player.x), y: Math.round(player.y), range, damage: def.damage, targetId: targetId || null });
-        } else if (def.kind === 'proj' || def.kind === 'proj_explode') {
-          // create projectile
-          const angleToUse = angle || 0;
+        } else if (def.kind === 'buff') {
+          // apply buff to caster (e.g., Rage)
+          const b = def.buff;
+          if (b) {
+            player.buffs = player.buffs || [];
+            player.buffs.push({ type: b.type, until: now + (b.durationMs || 0), multiplier: b.multiplier || 1.0 });
+            broadcast({ t:'cast_effect', casterId: player.id, casterName: player.name, type: def.type, skill: def.type, buff: b, x: Math.round(player.x), y: Math.round(player.y) });
+          }
+        } else if (def.kind === 'proj_target' || def.kind === 'proj_target_stun' || def.kind === 'proj_target_explode') {
+          // target required
+          if (!targetId) { try { ws.send(JSON.stringify({ t:'cast_rejected', reason:'no_target', slot })); } catch(e){} return; }
+          // find target (player or mob)
+          let targetEnt = null; let targetKind = null;
+          if (mobs.has(targetId)) { targetEnt = mobs.get(targetId); targetKind = 'mob'; }
+          else if (players.has(targetId)) { targetEnt = players.get(targetId); targetKind = 'player'; }
+          else { try { ws.send(JSON.stringify({ t:'cast_rejected', reason:'invalid_target', slot })); } catch(e){} return; }
+          // create projectile aimed at current target position
+          const tx = targetEnt.x, ty = targetEnt.y;
+          const angle = Math.atan2(ty - player.y, tx - player.x);
           const speed = def.speed || 500;
-          const vx = Math.cos(angleToUse) * speed;
-          const vy = Math.sin(angleToUse) * speed;
+          const vx = Math.cos(angle) * speed, vy = Math.sin(angle) * speed;
           const id = 'proj_' + (nextProjId++);
-          const ttl = (def.ttlMs ? now + def.ttlMs : now + 3000);
-          const proj = { id, type: def.type || 'proj', x: player.x, y: player.y, vx, vy, radius: def.radius || 6, ownerId: player.id, damage: def.damage || 10, ttl, explodeRadius: def.explodeRadius || 0, kind: def.kind };
+          const ttl = (def.ttlMs ? Date.now() + def.ttlMs : Date.now() + 3000);
+          const proj = { id, type: def.type || 'proj', x: player.x, y: player.y, vx, vy, radius: def.radius || 6, ownerId: player.id, damage: (def.damage || 10) * casterDamageMul, ttl, kind: 'target', targetId: targetId, stunMs: def.stunMs || 0 };
           projectiles.set(id, proj);
-          // no immediate broadcast required; snapshot will include it on next tick
+          // send effect
+          broadcast({ t:'cast_effect', casterId: player.id, casterName: player.name, type: def.type, skill: def.type, x: Math.round(player.x), y: Math.round(player.y), targetId });
+        } else if (def.kind === 'proj_burst') {
+          // burst N projectiles with spread toward aim (aimX/aimY or cursor angle)
+          const aimAngle = (typeof msg.angle === 'number') ? Number(msg.angle) : 0;
+          const count = def.count || 3;
+          const spread = (def.spreadDeg || 12) * Math.PI / 180;
+          for (let n = 0; n < count; n++) {
+            const offset = ((n - (count-1)/2) / (count-1)) * spread;
+            const angle = aimAngle + offset + (Math.random()*0.02 - 0.01);
+            const speed = def.speed || 500;
+            const vx = Math.cos(angle) * speed, vy = Math.sin(angle) * speed;
+            const id = 'proj_' + (nextProjId++);
+            const ttl = (def.ttlMs ? Date.now() + def.ttlMs : Date.now() + 3000);
+            const proj = { id, type: def.type || 'proj', x: player.x, y: player.y, vx, vy, radius: def.radius || 6, ownerId: player.id, damage: (def.damage || 10) * casterDamageMul, ttl, kind: 'burst' };
+            projectiles.set(id, proj);
+          }
+          broadcast({ t:'cast_effect', casterId: player.id, casterName: player.name, type: def.type, skill: def.type, x: Math.round(player.x), y: Math.round(player.y) });
+        } else if (def.kind === 'proj_target_stun') {
+          if (!targetId) { try { ws.send(JSON.stringify({ t:'cast_rejected', reason:'no_target', slot })); } catch(e){} return; }
+          // create projectile aimed at target; on hit stun
+          let targetEnt = null;
+          if (mobs.has(targetId)) targetEnt = mobs.get(targetId);
+          else if (players.has(targetId)) targetEnt = players.get(targetId);
+          else { try { ws.send(JSON.stringify({ t:'cast_rejected', reason:'invalid_target', slot })); } catch(e){} return; }
+          const tx = targetEnt.x, ty = targetEnt.y;
+          const angle = Math.atan2(ty - player.y, tx - player.x);
+          const speed = def.speed || 500;
+          const vx = Math.cos(angle) * speed, vy = Math.sin(angle) * speed;
+          const id = 'proj_' + (nextProjId++);
+          const ttl = (def.ttlMs ? Date.now() + def.ttlMs : Date.now() + 3000);
+          const proj = { id, type: def.type || 'proj', x: player.x, y: player.y, vx, vy, radius: def.radius || 6, ownerId: player.id, damage: (def.damage || 10) * casterDamageMul, ttl, stunMs: def.stunMs || 3000, kind: 'target' };
+          projectiles.set(id, proj);
+          broadcast({ t:'cast_effect', casterId: player.id, casterName: player.name, type: def.type, skill: def.type, x: Math.round(player.x), y: Math.round(player.y), targetId });
+        } else if (def.kind === 'proj_aoe_spread') {
+          // area multi-shot toward an aim point (requires aimX/aimY or angle)
+          let aimAngle = (typeof msg.angle === 'number') ? Number(msg.angle) : 0;
+          if (typeof aimX === 'number' && typeof aimY === 'number') {
+            aimAngle = Math.atan2(aimY - player.y, aimX - player.x);
+          }
+          const count = def.count || 5;
+          const spread = (def.spreadDeg || 45) * Math.PI / 180;
+          for (let n = 0; n < count; n++) {
+            const offset = (Math.random() - 0.5) * spread;
+            const angle = aimAngle + offset;
+            const speed = def.speed || 400;
+            const vx = Math.cos(angle) * speed, vy = Math.sin(angle) * speed;
+            const id = 'proj_' + (nextProjId++);
+            const ttl = (def.ttlMs ? Date.now() + def.ttlMs : Date.now() + 3000);
+            const proj = { id, type: def.type || 'proj', x: player.x, y: player.y, vx, vy, radius: def.radius || 6, ownerId: player.id, damage: (def.damage || 10) * casterDamageMul, ttl, kind: 'arcane' };
+            projectiles.set(id, proj);
+          }
+          broadcast({ t:'cast_effect', casterId: player.id, casterName: player.name, type: def.type, skill: def.type, x: Math.round(player.x), y: Math.round(player.y) });
+        } else {
+          // fallback: aoe damage around player
+          const ax = player.x, ay = player.y;
+          for (const m of mobs.values()) {
+            if (m.hp <= 0) continue;
+            const d = Math.hypot(m.x - ax, m.y - ay);
+            if (d <= (def.radius || 48) + (m.radius || 12)) damageMob(m, def.damage * casterDamageMul, player.id);
+          }
+          for (const p of players.values()) {
+            if (String(p.id) === String(player.id)) continue;
+            if (p.hp <= 0) continue;
+            const d = Math.hypot(p.x - ax, p.y - ay);
+            if (d <= (def.radius || 48) + (p.radius || 12)) applyDamageToPlayer(p, def.damage * casterDamageMul, player.id);
+          }
+          broadcast({ t:'cast_effect', casterId: player.id, casterName: player.name, type: def.type, skill: def.type, x: Math.round(ax), y: Math.round(ay), radius: def.radius, damage: def.damage });
         }
       }
     } catch (err) {
@@ -625,17 +710,15 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// Graceful shutdown
+// graceful shutdown
 function shutdown() {
   console.log('Shutting down...');
   try { clearInterval(heartbeatInterval); } catch(e){}
   try { wss.close(() => {}); } catch(e){}
   try { server.close(() => { process.exit(0); }); } catch(e) { process.exit(0); }
-  // force exit after timeout
   setTimeout(() => process.exit(0), 5000);
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-// Start listening
 server.listen(PORT, () => { console.log(`Moborr server listening on port ${PORT}`); });
