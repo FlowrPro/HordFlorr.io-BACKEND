@@ -83,16 +83,16 @@ function spawnMobAt(sp, typeName) {
   const x = sp.x + (Math.random() * jitter * 2 - jitter);
   const y = sp.y + (Math.random() * jitter * 2 - jitter);
   const id = 'mob_' + (nextMobId++);
-  const m = { id, type: typeName, x, y, vx:0, vy:0, hp:def.maxHp, maxHp:def.maxHp, radius:def.radius, aggroRadius:650, damageContrib: {}, spawnPoint: sp, def, respawnAt: null };
+  const m = { id, type: typeName, x, y, vx:0, vy:0, hp:def.maxHp, maxHp:def.maxHp, radius:def.radius, aggroRadius:650, damageContrib: {}, spawnPoint: sp, def, respawnAt: null, dead: false };
   mobs.set(id, m); return m;
 }
 for (const sp of mobSpawnPoints) for (let i=0;i<3;i++) spawnMobAt(sp, sp.types[Math.floor(Math.random()*sp.types.length)]);
 
 // --- Abilities / Skill definitions (server-side authoritative)
 const SKILL_DEFS = {
+  // Slash changed to melee (single-target)
   warrior: [
-    // slot1: instant slash AOE around caster
-    { kind: 'aoe', damage: 60, radius: 64, ttl: 0, type: 'slash' },
+    { kind: 'melee', damage: 60, range: 48, ttl: 0, type: 'slash' },
     { kind: 'aoe', damage: 40, radius: 48, ttl: 0, type: 'shieldbash' },
     // Charge: AoE damage + speed buff (server will apply a speed buff)
     { kind: 'aoe', damage: 50, radius: 80, ttl: 0, type: 'charge', buff: { type: 'speed', multiplier: 2, durationMs: 5000 } },
@@ -170,22 +170,32 @@ function broadcast(obj) {
   }
 }
 
-// Damage mob helper
+// Damage mob helper - robust and ensures death handled once
 function damageMob(mob, amount, playerId) {
-  if (!mob || mob.hp <= 0) return;
+  if (!mob) return;
+  if (typeof mob.hp !== 'number') mob.hp = Number(mob.hp) || 0;
+  if (mob.hp <= 0) return; // already dead
   mob.hp -= amount;
-  if (playerId) { mob.damageContrib[playerId] = (mob.damageContrib[playerId] || 0) + amount; }
-  if (mob.hp <= 0) handleMobDeath(mob);
+  if (mob.hp <= 0) {
+    // ensure death handled once
+    if (!mob.respawnAt) handleMobDeath(mob, playerId);
+  }
 }
-function handleMobDeath(mob) {
-  let topId = null, topDmg = 0;
+function handleMobDeath(mob, killerId = null) {
+  if (!mob) return;
+  if (mob.hp <= 0 && mob.respawnAt) {
+    // already processed
+    return;
+  }
+  let topId = killerId || null;
+  let topDmg = 0;
   for (const pid in mob.damageContrib) {
     const d = mob.damageContrib[pid];
     if (d > topDmg) { topDmg = d; topId = pid; }
   }
   const def = mob.def;
   const gold = Math.round(randRange(def.goldMin, def.goldMax));
-  const xp = def.xp;
+  const xp = def.xp || 0;
   if (topId && players.has(String(topId))) {
     const killer = players.get(String(topId));
     killer.gold = Number(killer.gold||0) + gold;
@@ -194,8 +204,10 @@ function handleMobDeath(mob) {
   } else {
     broadcast({ t:'mob_died', mobId: mob.id, mobType: mob.type, killerId: null, gold:0, xp:0 });
   }
-  mob.respawnAt = nowMs() + mob.def.respawn * 1000;
-  mob.hp = 0; mob.damageContrib = {};
+  mob.respawnAt = nowMs() + (mob.def.respawn || 10) * 1000;
+  mob.hp = 0;
+  mob.dead = true;
+  mob.damageContrib = {};
 }
 
 // Player damage & death
@@ -252,6 +264,7 @@ function serverTick() {
 
   // update mobs
   for (const m of mobs.values()) {
+    if (m.hp <= 0) continue;
     let target = null, bestD = Infinity;
     for (const p of players.values()) { if (p.hp <= 0) continue; const d = Math.hypot(m.x - p.x, m.y - p.y); if (d < m.aggroRadius && d < bestD) { bestD = d; target = p; } }
     if (target) {
@@ -268,7 +281,8 @@ function serverTick() {
   // update players
   for (const p of players.values()) {
     // clean expired buffs
-    p.buffs = (p.buffs || []).filter(b => b.until > now);
+    const nowMsVal = nowMs();
+    p.buffs = (p.buffs || []).filter(b => b.until > nowMsVal);
     let speedMultiplier = 1.0;
     for (const b of p.buffs) speedMultiplier *= (b.multiplier || 1.0);
 
@@ -479,8 +493,7 @@ wss.on('connection', (ws, req) => {
         // get angle from client if present (validate)
         let angle = 0;
         if (typeof msg.angle === 'number' && isFinite(msg.angle)) angle = Number(msg.angle);
-        // default to facing direction (no facing tracked server-side - fallback random)
-        // create effect based on kind
+
         if (def.kind === 'aoe') {
           // immediate aoe centered on player
           const ax = player.x, ay = player.y;
@@ -509,6 +522,35 @@ wss.on('connection', (ws, req) => {
 
           // notify clients of cast effect (clients can show VFX)
           broadcast({ t: 'cast_effect', casterId: player.id, casterName: player.name, type: def.type || 'aoe', skill: def.type || 'aoe', x: Math.round(ax), y: Math.round(ay), radius: def.radius, damage: def.damage, buff: buffInfo });
+        } else if (def.kind === 'melee') {
+          // single-target melee: find nearest mob within range and damage it; otherwise damage players
+          const range = def.range || 48;
+          let closest = null;
+          let closestD = Infinity;
+          for (const m of mobs.values()) {
+            if (m.hp <= 0) continue;
+            const d = Math.hypot(m.x - player.x, m.y - player.y);
+            if (d <= range + (m.radius || 12) && d < closestD) { closestD = d; closest = m; }
+          }
+          let targetId = null;
+          if (closest) {
+            damageMob(closest, def.damage, player.id);
+            targetId = closest.id;
+          } else {
+            // try hitting other players (PvP)
+            for (const p2 of players.values()) {
+              if (String(p2.id) === String(player.id)) continue;
+              if (p2.hp <= 0) continue;
+              const d = Math.hypot(p2.x - player.x, p2.y - player.y);
+              if (d <= range + (p2.radius || 12) && d < closestD) { closestD = d; closest = p2; }
+            }
+            if (closest && closest.id) {
+              applyDamageToPlayer(closest, def.damage, player.id);
+              targetId = closest.id;
+            }
+          }
+          // broadcast melee effect (clients can show hit / short VFX)
+          broadcast({ t: 'cast_effect', casterId: player.id, casterName: player.name, type: def.type || 'melee', skill: def.type || 'melee', x: Math.round(player.x), y: Math.round(player.y), range, damage: def.damage, targetId: targetId || null });
         } else if (def.kind === 'proj' || def.kind === 'proj_explode') {
           // create projectile
           const angleToUse = angle || 0;
