@@ -2,6 +2,7 @@
 // Run: node server.js
 // Environment:
 //  - PORT (optional)
+//  - ALLOWED_ORIGINS (optional, comma-separated list of allowed origins for WebSocket upgrades)
 //
 // NOTE: This server intentionally contains no registration/signup/auth code — it accepts guest joins only.
 
@@ -153,6 +154,9 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ server });
 
+// Optional origin allow list (comma-separated env var)
+const allowedOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean) : null;
+
 // Broadcast helper
 function broadcast(obj) {
   const msg = JSON.stringify(obj);
@@ -298,7 +302,18 @@ function serverTick() {
       if (m.hp <= 0) continue;
       const d = Math.hypot(proj.x - m.x, proj.y - m.y);
       if (d <= ((proj.radius || 6) + (m.radius || 12))) {
-        damageMob(m, proj.damage, proj.ownerId);
+        // If projectile explodes, do AoE damage
+        if (proj.kind === 'proj_explode' && proj.explodeRadius && proj.explodeRadius > 0) {
+          for (const m2 of mobs.values()) {
+            if (m2.hp <= 0) continue;
+            const d2 = Math.hypot(proj.x - m2.x, proj.y - m2.y);
+            if (d2 <= proj.explodeRadius + (m2.radius || 12)) {
+              damageMob(m2, proj.damage, proj.ownerId);
+            }
+          }
+        } else {
+          damageMob(m, proj.damage, proj.ownerId);
+        }
         hit = true; break;
       }
     }
@@ -309,7 +324,25 @@ function serverTick() {
       if (p.hp <= 0) continue;
       const d = Math.hypot(proj.x - p.x, proj.y - p.y);
       if (d <= ((proj.radius || 6) + (p.radius || 12))) {
-        applyDamageToPlayer(p, proj.damage, proj.ownerId);
+        if (proj.kind === 'proj_explode' && proj.explodeRadius && proj.explodeRadius > 0) {
+          // AoE damage to nearby players and mobs
+          for (const p2 of players.values()) {
+            if (p2.hp <= 0) continue;
+            const d2 = Math.hypot(proj.x - p2.x, proj.y - p2.y);
+            if (d2 <= proj.explodeRadius + (p2.radius || 12)) {
+              applyDamageToPlayer(p2, proj.damage, proj.ownerId);
+            }
+          }
+          for (const m2 of mobs.values()) {
+            if (m2.hp <= 0) continue;
+            const d2 = Math.hypot(proj.x - m2.x, proj.y - m2.y);
+            if (d2 <= proj.explodeRadius + (m2.radius || 12)) {
+              damageMob(m2, proj.damage, proj.ownerId);
+            }
+          }
+        } else {
+          applyDamageToPlayer(p, proj.damage, proj.ownerId);
+        }
         hit = true; break;
       }
     }
@@ -326,8 +359,42 @@ function serverTick() {
 
 setInterval(serverTick, Math.round(1000 / TICK_RATE));
 
+// --- Heartbeat and stale-player cleanup ---
+const HEARTBEAT_INTERVAL_MS = 30000;
+const PLAYER_STALE_MS = 120000; // 2 minutes
+
+const heartbeatInterval = setInterval(() => {
+  const now = Date.now();
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      try { ws.terminate(); } catch (e) {}
+      return;
+    }
+    ws.isAlive = false;
+    try { ws.ping(() => {}); } catch (e) {}
+  });
+
+  // sweep stale players (in case connections dropped silently)
+  for (const [id, p] of players.entries()) {
+    if (now - (p.lastSeen || 0) > PLAYER_STALE_MS) {
+      if (p.ws && p.ws.terminate) try { p.ws.terminate(); } catch (e) {}
+      players.delete(id);
+      console.log('Removed stale player', id);
+    }
+  }
+}, HEARTBEAT_INTERVAL_MS);
+
 // --- WebSocket handling (guest join only) ---
 wss.on('connection', (ws, req) => {
+  // Optional origin check
+  if (allowedOrigins && req && req.headers && req.headers.origin) {
+    if (!allowedOrigins.includes(req.headers.origin)) {
+      console.log('Rejecting connection from origin', req.headers.origin);
+      try { ws.close(1008, 'Origin not allowed'); } catch (e) {}
+      return;
+    }
+  }
+
   console.log('connection from', req.socket.remoteAddress);
   ws.isAlive = true;
   ws.on('pong', () => ws.isAlive = true);
@@ -453,6 +520,18 @@ wss.on('connection', (ws, req) => {
     if (ws.playerId) players.delete(String(ws.playerId));
   });
 });
+
+// Graceful shutdown
+function shutdown() {
+  console.log('Shutting down...');
+  try { clearInterval(heartbeatInterval); } catch(e){}
+  try { wss.close(() => {}); } catch(e){}
+  try { server.close(() => { process.exit(0); }); } catch(e) { process.exit(0); }
+  // force exit after timeout
+  setTimeout(() => process.exit(0), 5000);
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
 
 // Start listening
 server.listen(PORT, () => { console.log(`Moborr server listening on port ${PORT}`); });
