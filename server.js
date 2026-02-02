@@ -66,35 +66,71 @@ const walls = [
 const mobDefs = {
   goblin: { name: 'Goblin', maxHp: 120, atk: 14, speed: 140, xp: 12, goldMin: 6, goldMax: 14, respawn: 12, radius: 22 },
   wolf:   { name: 'Wolf',   maxHp: 180, atk: 20, speed: 170, xp: 20, goldMin: 12, goldMax: 20, respawn: 18, radius: 26 },
-  slime:  { name: 'Slime',  maxHp: 80,  atk: 8,  speed: 100, xp: 6,  goldMin: 2,  goldMax: 6,  respawn: 10, radius: 18 }
+  slime:  { name: 'Slime',  maxHp: 80,  atk: 8,  speed: 100, xp: 6,  goldMin: 2,  goldMax: 6,  respawn: 10, radius: 18 },
+  boar:   { name: 'Boar',   maxHp: 150, atk: 18, speed: 150, xp: 16, goldMin: 8, goldMax: 16, respawn: 14, radius: 24 }
 };
 
 const mobSpawnPoints = [
-  { x: -MAP_HALF + CELL * 2 + CELL/2, y: -MAP_HALF + CELL*2 + CELL/2, types: ['goblin','slime'] },
-  { x: -MAP_HALF + CELL * 6 + CELL/2, y: -MAP_HALF + CELL*6 + CELL/2, types: ['wolf','goblin'] },
-  { x: -MAP_HALF + CELL * 10 + CELL/2, y: -MAP_HALF + CELL*3 + CELL/2, types: ['goblin','slime'] },
-  { x: -MAP_HALF + CELL * 3 + CELL/2, y: -MAP_HALF + CELL*9 + CELL/2, types: ['slime','goblin'] },
-  { x: -MAP_HALF + CELL * 9 + CELL/2, y: -MAP_HALF + CELL*8 + CELL/2, types: ['wolf','goblin'] },
+  { x: -MAP_HALF + CELL * 2 + CELL/2, y: -MAP_HALF + CELL*2 + CELL/2, types: ['goblin','slime','boar'] },
+  { x: -MAP_HALF + CELL * 6 + CELL/2, y: -MAP_HALF + CELL*6 + CELL/2, types: ['wolf','goblin','boar'] },
+  { x: -MAP_HALF + CELL * 10 + CELL/2, y: -MAP_HALF + CELL*3 + CELL/2, types: ['goblin','slime','boar'] },
+  { x: -MAP_HALF + CELL * 3 + CELL/2, y: -MAP_HALF + CELL*9 + CELL/2, types: ['slime','goblin','boar'] },
+  { x: -MAP_HALF + CELL * 9 + CELL/2, y: -MAP_HALF + CELL*8 + CELL/2, types: ['wolf','goblin','boar'] },
+  // Add extra spawn points for more coverage
+  { x: -MAP_HALF + CELL * 5 + CELL/2, y: -MAP_HALF + CELL*2 + CELL/2, types: ['slime','goblin'] },
+  { x: -MAP_HALF + CELL * 2 + CELL/2, y: -MAP_HALF + CELL*8 + CELL/2, types: ['goblin','wolf'] }
 ];
+
+// check if a point is inside any wall (with a safety margin)
+function pointInsideWall(x, y, margin = 6) {
+  for (const w of walls) {
+    if (x >= w.x - margin && x <= w.x + w.w + margin && y >= w.y - margin && y <= w.y + w.h + margin) return true;
+  }
+  return false;
+}
 
 function spawnMobAt(sp, typeName) {
   const def = mobDefs[typeName]; if (!def) return null;
-  const jitter = 80;
-  const x = sp.x + (Math.random() * jitter * 2 - jitter);
-  const y = sp.y + (Math.random() * jitter * 2 - jitter);
+  const jitter = 120;
+  const maxAttempts = 12;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const x = sp.x + (Math.random() * jitter * 2 - jitter);
+    const y = sp.y + (Math.random() * jitter * 2 - jitter);
+    // clamp to map (avoid edges)
+    const limit = MAP_HALF - (def.radius || 18) - 12;
+    if (x < -limit || x > limit || y < -limit || y > limit) continue;
+    if (pointInsideWall(x, y, 8)) continue; // invalid, inside or too close to wall
+    const id = 'mob_' + (nextMobId++);
+    const m = { id, type: typeName, x, y, vx:0, vy:0, hp:def.maxHp, maxHp:def.maxHp, radius:def.radius, aggroRadius:650, damageContrib: {}, spawnPoint: sp, def, respawnAt: null, dead: false };
+    mobs.set(id, m); return m;
+  }
+  // if no valid spot found, place at spawn point fallback (but offset outward until not in wall)
+  let fallbackX = sp.x, fallbackY = sp.y;
+  let step = 0;
+  while (pointInsideWall(fallbackX, fallbackY, 8) && step < 8) {
+    fallbackX += (step % 2 === 0 ? 1 : -1) * (def.radius + 20) * (step + 1);
+    fallbackY += (step % 3 === 0 ? -1 : 1) * (def.radius + 20) * (step + 1);
+    step++;
+  }
   const id = 'mob_' + (nextMobId++);
-  const m = { id, type: typeName, x, y, vx:0, vy:0, hp:def.maxHp, maxHp:def.maxHp, radius:def.radius, aggroRadius:650, damageContrib: {}, spawnPoint: sp, def, respawnAt: null, dead: false };
+  const m = { id, type: typeName, x: fallbackX, y: fallbackY, vx:0, vy:0, hp:def.maxHp, maxHp:def.maxHp, radius:def.radius, aggroRadius:650, damageContrib: {}, spawnPoint: sp, def, respawnAt: null, dead: false };
   mobs.set(id, m); return m;
 }
-for (const sp of mobSpawnPoints) for (let i=0;i<3;i++) spawnMobAt(sp, sp.types[Math.floor(Math.random()*sp.types.length)]);
+
+// spawn initial mobs - increase density (but not excessive)
+for (const sp of mobSpawnPoints) {
+  const count = 4 + Math.floor(Math.random() * 3); // 4-6 per spawn point
+  for (let i = 0; i < count; i++) {
+    const t = sp.types[Math.floor(Math.random() * sp.types.length)];
+    spawnMobAt(sp, t);
+  }
+}
 
 // --- Abilities / Skill definitions (server-side authoritative)
 const SKILL_DEFS = {
-  // Slash changed to melee (single-target)
   warrior: [
     { kind: 'melee', damage: 60, range: 48, ttl: 0, type: 'slash' },
     { kind: 'aoe', damage: 40, radius: 48, ttl: 0, type: 'shieldbash' },
-    // Charge: AoE damage + speed buff (server will apply a speed buff)
     { kind: 'aoe', damage: 50, radius: 80, ttl: 0, type: 'charge', buff: { type: 'speed', multiplier: 2, durationMs: 5000 } },
     { kind: 'aoe', damage: 120, radius: 90, ttl: 0, type: 'rage' }
   ],
@@ -123,8 +159,18 @@ const CLASS_COOLDOWNS_MS = {
 function nowMs(){ return Date.now(); }
 function randRange(min,max){ return Math.random()*(max-min)+min; }
 
-// Spawn position
-function spawnPosition() { return { x: -MAP_HALF + SPAWN_MARGIN, y: MAP_HALF - SPAWN_MARGIN }; }
+// Spawn position (choose a spawn point area)
+function spawnPosition() {
+  const sp = mobSpawnPoints[Math.floor(Math.random() * mobSpawnPoints.length)];
+  const jitter = 120;
+  // try to find a free spot near the spawn point
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const x = sp.x + (Math.random() * jitter * 2 - jitter);
+    const y = sp.y + (Math.random() * jitter * 2 - jitter);
+    if (!pointInsideWall(x, y, 8)) return { x, y };
+  }
+  return { x: sp.x, y: sp.y };
+}
 
 // Create runtime player. If fixedId is provided, use that as player's id.
 function createPlayerRuntime(ws, opts = {}) {
@@ -176,6 +222,7 @@ function damageMob(mob, amount, playerId) {
   if (typeof mob.hp !== 'number') mob.hp = Number(mob.hp) || 0;
   if (mob.hp <= 0) return; // already dead
   mob.hp -= amount;
+  if (playerId) { mob.damageContrib[playerId] = (mob.damageContrib[playerId] || 0) + amount; }
   if (mob.hp <= 0) {
     // ensure death handled once
     if (!mob.respawnAt) handleMobDeath(mob, playerId);
@@ -183,10 +230,7 @@ function damageMob(mob, amount, playerId) {
 }
 function handleMobDeath(mob, killerId = null) {
   if (!mob) return;
-  if (mob.hp <= 0 && mob.respawnAt) {
-    // already processed
-    return;
-  }
+  if (mob.respawnAt) return; // already processed
   let topId = killerId || null;
   let topDmg = 0;
   for (const pid in mob.damageContrib) {
@@ -372,8 +416,8 @@ function serverTick() {
   }
   for (const id of toRemove) projectiles.delete(id);
 
-  // broadcast snapshot
-  const playerList = Array.from(players.values()).map(p => ({ id: p.id, name: p.name, x: Math.round(p.x), y: Math.round(p.y), vx: Math.round(p.vx), vy: Math.round(p.vy), radius: p.radius, color: p.color, hp: Math.round(p.hp), maxHp: Math.round(p.maxHp), level: 1 }));
+  // broadcast snapshot (now includes xp so clients stay authoritative)
+  const playerList = Array.from(players.values()).map(p => ({ id: p.id, name: p.name, x: Math.round(p.x), y: Math.round(p.y), vx: Math.round(p.vx), vy: Math.round(p.vy), radius: p.radius, color: p.color, hp: Math.round(p.hp), maxHp: Math.round(p.maxHp), level: 1, xp: Math.round(p.xp || 0) }));
   const mobList = Array.from(mobs.values()).map(m => ({ id: m.id, type: m.type, x: Math.round(m.x), y: Math.round(m.y), hp: Math.round(m.hp), maxHp: Math.round(m.maxHp), radius: m.radius }));
   const projList = Array.from(projectiles.values()).map(p => ({ id: p.id, type: p.type, x: Math.round(p.x), y: Math.round(p.y), vx: Math.round(p.vx), vy: Math.round(p.vy), radius: p.radius, owner: p.ownerId, ttl: Math.max(0, p.ttl ? Math.round(p.ttl - now) : 0) }));
   broadcast({ t:'snapshot', tick: nowMs(), players: playerList, mobs: mobList, projectiles: projList });
