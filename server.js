@@ -94,7 +94,8 @@ const SKILL_DEFS = {
     // slot1: instant slash AOE around caster
     { kind: 'aoe', damage: 60, radius: 64, ttl: 0, type: 'slash' },
     { kind: 'aoe', damage: 40, radius: 48, ttl: 0, type: 'shieldbash' },
-    { kind: 'aoe', damage: 50, radius: 80, ttl: 0, type: 'charge' },
+    // Charge: AoE damage + speed buff (server will apply a speed buff)
+    { kind: 'aoe', damage: 50, radius: 80, ttl: 0, type: 'charge', buff: { type: 'speed', multiplier: 2, durationMs: 5000 } },
     { kind: 'aoe', damage: 120, radius: 90, ttl: 0, type: 'rage' }
   ],
   ranger: [
@@ -138,7 +139,9 @@ function createPlayerRuntime(ws, opts = {}) {
     maxHp: 200, hp: 200, xp: 0, gold: 0,
     lastAttackTime: 0, attackCooldown: 0.6, baseDamage: 18, invulnerableUntil: 0,
     class: opts.class || 'warrior',
-    cooldowns: {} // slot cooldown timestamps (ms) keyed by slot index 1..4
+    cooldowns: {}, // slot cooldown timestamps (ms) keyed by slot index 1..4
+    baseSpeed: 380,
+    buffs: [] // array of { type, until(ms), multiplier }
   };
   players.set(String(p.id), p);
   return p;
@@ -264,7 +267,12 @@ function serverTick() {
 
   // update players
   for (const p of players.values()) {
-    const inVec = p.lastInput || { x:0, y:0 }; const speed = 380; const vx = inVec.x * speed, vy = inVec.y * speed;
+    // clean expired buffs
+    p.buffs = (p.buffs || []).filter(b => b.until > now);
+    let speedMultiplier = 1.0;
+    for (const b of p.buffs) speedMultiplier *= (b.multiplier || 1.0);
+
+    const inVec = p.lastInput || { x:0, y:0 }; const speed = (p.baseSpeed || 380) * speedMultiplier; const vx = inVec.x * speed, vy = inVec.y * speed;
     p.x += vx * TICK_DT; p.y += vy * TICK_DT; p.vx = vx; p.vy = vy;
     const limit = MAP_HALF - p.radius - 1;
     if (p.x > limit) p.x = limit; if (p.x < -limit) p.x = -limit; if (p.y > limit) p.y = limit; if (p.y < -limit) p.y = -limit;
@@ -489,8 +497,18 @@ wss.on('connection', (ws, req) => {
             const d = Math.hypot(p.x - ax, p.y - ay);
             if (d <= def.radius + (p.radius || 12)) applyDamageToPlayer(p, def.damage, player.id);
           }
+
+          // apply buff for Charge (if defined)
+          let buffInfo = null;
+          if (def.type === 'charge' && def.buff) {
+            const b = def.buff;
+            player.buffs = player.buffs || [];
+            player.buffs.push({ type: b.type, until: now + (b.durationMs || 0), multiplier: b.multiplier || 1.0 });
+            buffInfo = { type: b.type, multiplier: b.multiplier, durationMs: b.durationMs };
+          }
+
           // notify clients of cast effect (clients can show VFX)
-          broadcast({ t: 'cast_effect', casterId: player.id, casterName: player.name, type: def.type || 'aoe', skill: def.type || 'aoe', x: Math.round(ax), y: Math.round(ay), radius: def.radius, damage: def.damage });
+          broadcast({ t: 'cast_effect', casterId: player.id, casterName: player.name, type: def.type || 'aoe', skill: def.type || 'aoe', x: Math.round(ax), y: Math.round(ay), radius: def.radius, damage: def.damage, buff: buffInfo });
         } else if (def.kind === 'proj' || def.kind === 'proj_explode') {
           // create projectile
           const angleToUse = angle || 0;
