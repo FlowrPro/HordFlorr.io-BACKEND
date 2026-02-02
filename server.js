@@ -1,8 +1,14 @@
-// UPDATED server.js — polygon-based maze and robust error handling (fixes join/welcome timeouts).
-// - Map half-size is half of the previous 18000 -> 9000
-// - Walls are sent as polygons (one long winding wall produced by expanding a centerline path)
-// - Server-side collision/tests now support polygon walls and keep rectangular walls for backwards compatibility
-// - Robust try/catch to avoid silent crashes during join
+// Updated authoritative game server for Moborr.io
+// - Kept the rectangular maze-style walls (no polygon code)
+// - Map half-size reduced (half the previous scale used earlier)
+// - Players always spawn at bottom-left fixed spawn point
+// - Restored full ability / projectile handling (projectiles, AoE, stuns, etc.)
+// - Wrapped WebSocket message handling in try/catch and made sends defensive
+//
+// Run: node server.js
+// Environment:
+//  - PORT (optional)
+// NOTE: This server intentionally contains no registration/signup/auth code — it accepts guest joins only.
 
 const http = require('http');
 const WebSocket = require('ws');
@@ -10,7 +16,8 @@ const WebSocket = require('ws');
 const PORT = process.env.PORT || 8080;
 
 // --- World / tick ---
-const MAP_HALF = 9000; // halved from 18000
+// NOTE: using a halved map scale compared to an earlier large version
+const MAP_HALF = 9000; // reduced scale (was 18000 before)
 const MAP_SIZE = MAP_HALF * 2;
 const MAP_TYPE = 'square';
 const TICK_RATE = 20;
@@ -19,8 +26,8 @@ const TICK_DT = 1 / TICK_RATE;
 const CHAT_MAX_PER_WINDOW = 2;
 const CHAT_WINDOW_MS = 1000;
 
-// adjusted thickness / margins for new scale
-const WALL_THICKNESS = 672; // approx previous /2
+// scale wall thickness and spawn margin appropriately for this map size
+const WALL_THICKNESS = 672; // used only for reference; walls defined explicitly
 const SPAWN_MARGIN = 450;
 
 let nextPlayerId = 1;
@@ -32,112 +39,84 @@ const mobs = new Map();
 const projectiles = new Map();
 let nextProjId = 1;
 
-// --- Map helpers (grid & polygon generation) ---
+// --- Map walls (12x12 grid scaled) ---
+// Keep the box/row helpers so it's easy to author map pieces in cell coordinates.
 const CELL = MAP_SIZE / 12;
-const GAP = Math.floor(Math.max(24, CELL * 0.05)); // small gap relative to cell size
+const GAP = 120; // keep corridor gap similar to prior design
 
-function gridToWorldCenter(col, row) {
-  // center of a cell in world coordinates
-  const x = -MAP_HALF + (col - 0.5) * CELL;
-  const y = -MAP_HALF + (row - 0.5) * CELL;
-  return { x, y };
+function h(col, row, lenCells, id) {
+  return { id: id || `h_${col}_${row}_${lenCells}`, x: -MAP_HALF + (col - 1) * CELL + GAP, y: -MAP_HALF + (row - 1) * CELL + GAP, w: Math.max(1, lenCells) * CELL - GAP * 2, h: WALL_THICKNESS };
+}
+function v(col, row, lenCells, id) {
+  return { id: id || `v_${col}_${row}_${lenCells}`, x: -MAP_HALF + (col - 1) * CELL + GAP, y: -MAP_HALF + (row - 1) * CELL + GAP, w: WALL_THICKNESS, h: Math.max(1, lenCells) * CELL - GAP * 2 };
+}
+function box(col, row, wCells, hCells, id) {
+  return { id: id || `box_${col}_${row}_${wCells}x${hCells}`, x: -MAP_HALF + (col - 1) * CELL + GAP, y: -MAP_HALF + (row - 1) * CELL + GAP, w: Math.max(1, wCells) * CELL - GAP * 2, h: Math.max(1, hCells) * CELL - GAP * 2 };
 }
 
-// Utility: normalize vector
-function normalize(vx, vy) {
-  const len = Math.hypot(vx, vy) || 1;
-  return { x: vx / len, y: vy / len };
-}
+// Build a maze-like wall layout approximating the provided image (black = walls).
+// We're using the 12x12 cell grid and combining boxes to make thick walls that form tunnels.
+const walls = [
+  // Outer ring (thick) — leave interior corridors
+  box(1, 1, 12, 1, 'outer_top'),
+  box(1, 12, 12, 1, 'outer_bottom'),
+  box(1, 1, 1, 12, 'outer_left'),
+  box(12, 1, 1, 12, 'outer_right'),
 
-// Build a single long winding centerline path (12x12 grid-based waypoints)
-// This list can be tuned to better match your reference image. It intentionally snakes to create corridors.
-const centerlineGrid = [
-  [2,1],[2,3],[4,3],[4,1],[6,1],[6,3],[8,3],[8,1],[10,1],
-  [10,3],[10,5],[8,5],[8,7],[6,7],[6,5],[4,5],[4,7],[2,7],
-  [2,9],[4,9],[4,11],[6,11],[6,9],[8,9],[8,11],[10,11]
+  // Internal vertical walls (left area)
+  box(2, 2, 1, 3, 'v_left_1'),
+  box(2, 6, 1, 3, 'v_left_2'),
+  box(2, 10, 1, 2, 'v_left_3'),
+
+  // Horizontal walls forming spiral-like left-top
+  box(3, 2, 4, 1, 'h_top_spiral'),
+  box(6, 3, 1, 3, 'v_spiral_center'),
+  box(4, 5, 4, 1, 'h_mid_spiral'),
+
+  // Central vertical bar
+  box(6, 1, 1, 12, 'center_bar_full'),
+
+  // Right-side more complex pathing
+  box(8, 2, 1, 2, 'v_right_1'),
+  box(10, 2, 1, 2, 'v_right_2'),
+  box(9, 4, 3, 1, 'h_right_mid_1'),
+  box(8, 6, 1, 3, 'v_right_mid_2'),
+  box(10, 9, 1, 2, 'v_right_bottom'),
+
+  // Lower-left labyrinth pieces
+  box(3, 8, 2, 1, 'box_lower_left_1'),
+  box(2, 9, 1, 2, 'v_lower_left'),
+  box(4, 10, 3, 1, 'h_lower_left'),
+
+  // Lower-right corridors and corners
+  box(7, 9, 2, 1, 'box_lower_center'),
+  box(9, 10, 2, 1, 'box_lower_right'),
+  box(11, 8, 1, 2, 'v_lower_right'),
+
+  // Small interior islands to force turns (scattered)
+  box(4, 3, 1, 1, 'island_a'),
+  box(5, 6, 1, 1, 'island_b'),
+  box(8, 4, 1, 1, 'island_c'),
+  box(7, 7, 1, 1, 'island_d'),
+
+  // Additional connectors to emulate maze loops
+  box(3, 7, 4, 1, 'h_middle_left'),
+  box(5, 4, 1, 2, 'v_inner_left_connector'),
+  box(9, 5, 1, 2, 'v_inner_right_connector'),
+
+  // Narrow corridor endings
+  box(5, 11, 2, 1, 'h_near_bottom_center'),
+  box(10, 11, 1, 1, 'h_near_bottom_right'),
+
+  // Small blocks to close off direct lines (increase maze complexity)
+  box(6, 4, 1, 1, 'block_center_1'),
+  box(8, 8, 1, 1, 'block_center_2'),
+
+  // extra scattered blockers to better match the winding paths
+  box(3, 10, 1, 1, 'block_ll'),
+  box(11, 3, 1, 1, 'block_ur'),
+  box(7, 3, 1, 1, 'block_mid_top')
 ];
-
-// Convert grid centerline to world points
-const centerline = centerlineGrid.map(([c,r]) => gridToWorldCenter(c, r));
-
-// Given a polyline (centerline) compute a thick polygon (approximate) by offsetting left/right per-vertex
-function polylineToThickPolygon(points, thickness) {
-  if (!points || points.length < 2) return [];
-  const half = thickness / 2;
-  const left = [];
-  const right = [];
-
-  // compute normals per segment
-  const normals = [];
-  for (let i = 0; i < points.length - 1; i++) {
-    const a = points[i], b = points[i+1];
-    const dir = normalize(b.x - a.x, b.y - a.y);
-    // perpendicular (normal) to the right-hand side
-    normals.push({ x: -dir.y, y: dir.x });
-  }
-
-  // compute per-vertex averaged normals (miter-like)
-  for (let i = 0; i < points.length; i++) {
-    let n = { x: 0, y: 0 };
-    if (i === 0) {
-      n = normals[0] || { x: 0, y: 1 };
-    } else if (i === points.length - 1) {
-      n = normals[normals.length - 1] || { x: 0, y: 1 };
-    } else {
-      n.x = (normals[i-1] ? normals[i-1].x : 0) + (normals[i] ? normals[i].x : 0);
-      n.y = (normals[i-1] ? normals[i-1].y : 0) + (normals[i] ? normals[i].y : 0);
-      // if nearly zero (straight 180deg), fall back
-      if (Math.hypot(n.x, n.y) < 1e-4) {
-        n = normals[i] || { x: 0, y: 1 };
-      } else {
-        n = normalize(n.x, n.y);
-      }
-    }
-    // clamp magnitude to avoid extreme miters in tight corners
-    left.push({ x: points[i].x + n.x * half, y: points[i].y + n.y * half });
-    right.push({ x: points[i].x - n.x * half, y: points[i].y - n.y * half });
-  }
-
-  // build polygon: left side in forward order, right side in reverse order
-  const polygon = [];
-  for (const p of left) polygon.push({ x: Math.round(p.x), y: Math.round(p.y) });
-  for (let i = right.length - 1; i >= 0; i--) polygon.push({ x: Math.round(right[i].x), y: Math.round(right[i].y) });
-
-  // make sure polygon is valid (at least 3 points)
-  if (polygon.length < 3) return [];
-  return polygon;
-}
-
-// Create a single thick polygon wall from centerline, safely
-let longWallPolygonPoints = [];
-try {
-  const WALL_THICKNESS_WORLD = Math.max( Math.floor(CELL * 0.9), WALL_THICKNESS * 0.8 );
-  longWallPolygonPoints = polylineToThickPolygon(centerline, WALL_THICKNESS_WORLD);
-  if (!Array.isArray(longWallPolygonPoints) || longWallPolygonPoints.length < 3) {
-    console.warn('polylineToThickPolygon produced insufficient points; falling back to boxed outer wall');
-    longWallPolygonPoints = [];
-  }
-} catch (err) {
-  console.error('Error generating polygon wall:', err);
-  longWallPolygonPoints = [];
-}
-
-// Fallback walls if polygon generation failed
-let walls = [];
-if (longWallPolygonPoints && longWallPolygonPoints.length >= 3) {
-  walls = [
-    { id: 'maze_wall_poly_1', points: longWallPolygonPoints }
-  ];
-} else {
-  // Fallback: outer boxes (simple ring) so server still works even if polygon generation fails.
-  const box = (col, row, wCells, hCells, id) => ({ id: id || `box_${col}_${row}_${wCells}x${hCells}`, x: -MAP_HALF + (col - 1) * CELL + GAP, y: -MAP_HALF + (row - 1) * CELL + GAP, w: Math.max(1, wCells) * CELL - GAP * 2, h: Math.max(1, hCells) * CELL - GAP * 2 });
-  walls = [
-    box(1,1,12,1,'outer_top'),
-    box(1,12,12,1,'outer_bottom'),
-    box(1,1,1,12,'outer_left'),
-    box(12,1,1,12,'outer_right')
-  ];
-}
 
 // --- Mob definitions and spawn points ---
 const mobDefs = {
@@ -147,6 +126,7 @@ const mobDefs = {
   boar:   { name: 'Boar',   maxHp: 150, atk: 18, speed: 150, xp: 16, goldMin: 8, goldMax: 16, respawn: 14, radius: 24 }
 };
 
+// Use a spread of spawn points across the 12x grid (scaled via CELL)
 const mobSpawnPoints = [
   { x: -MAP_HALF + CELL * 2 + CELL/2, y: -MAP_HALF + CELL*2 + CELL/2, types: ['goblin','slime','boar'] },
   { x: -MAP_HALF + CELL * 6 + CELL/2, y: -MAP_HALF + CELL*6 + CELL/2, types: ['wolf','goblin','boar'] },
@@ -157,111 +137,29 @@ const mobSpawnPoints = [
   { x: -MAP_HALF + CELL * 2 + CELL/2, y: -MAP_HALF + CELL*8 + CELL/2, types: ['goblin','wolf'] }
 ];
 
-// ---------------- polygon utilities for tests / collisions ----------------
-
-// Ray-casting point-in-polygon (winding/ray method)
-function pointInPolygon(x, y, polygon) {
-  let inside = false;
-  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
-    const xi = polygon[i].x, yi = polygon[i].y;
-    const xj = polygon[j].x, yj = polygon[j].y;
-    const intersect = ((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi + 0.0) + xi);
-    if (intersect) inside = !inside;
-  }
-  return inside;
-}
-
-// Distance from point to segment and closest point
-function pointToSegmentDistance(px, py, ax, ay, bx, by) {
-  const vx = bx - ax, vy = by - ay;
-  const wx = px - ax, wy = py - ay;
-  const dv = vx*vx + vy*vy;
-  let t = dv > 0 ? (wx * vx + wy * vy) / dv : 0;
-  t = Math.max(0, Math.min(1, t));
-  const cx = ax + vx * t, cy = ay + vy * t;
-  const dx = px - cx, dy = py - cy;
-  return { dist: Math.hypot(dx, dy), closest: { x: cx, y: cy }, t };
-}
-
-// Resolve a circle against a polygon: push circle outside if overlap
-function resolveCirclePolygon(p, poly) {
-  const inside = pointInPolygon(p.x, p.y, poly);
-  let minOverlap = Infinity;
-  let pushVec = null;
-
-  // check each edge
-  for (let i = 0; i < poly.length; i++) {
-    const a = poly[i];
-    const b = poly[(i+1) % poly.length];
-    const res = pointToSegmentDistance(p.x, p.y, a.x, a.y, b.x, b.y);
-    const d = res.dist;
-    const overlap = p.radius - d;
-    if (overlap > 0 && overlap < minOverlap) {
-      // compute outward normal from edge
-      const ex = b.x - a.x, ey = b.y - a.y;
-      let nx = -ey, ny = ex;
-      const nlen = Math.hypot(nx, ny) || 1;
-      nx /= nlen; ny /= nlen;
-      // determine sign of normal: sample point slightly along normal from closest point; if sample is inside poly, flip
-      const sampleX = res.closest.x + nx * 2;
-      const sampleY = res.closest.y + ny * 2;
-      const sampleInside = pointInPolygon(sampleX, sampleY, poly);
-      if (sampleInside) { nx = -nx; ny = -ny; }
-      minOverlap = overlap;
-      pushVec = { nx, ny, overlap };
-    }
-  }
-
-  if (inside && pushVec == null) {
-    // fallback: push outward by centroid
-    let cx = 0, cy = 0;
-    for (const q of poly) { cx += q.x; cy += q.y; }
-    cx /= poly.length; cy /= poly.length;
-    let nx = p.x - cx, ny = p.y - cy;
-    const nl = Math.hypot(nx, ny) || 1;
-    nx /= nl; ny /= nl;
-    const overlap = p.radius + 1;
-    p.x += nx * overlap; p.y += ny * overlap;
-    p.vx = 0; p.vy = 0;
-    return;
-  }
-
-  if (pushVec && pushVec.overlap > 0) {
-    p.x += pushVec.nx * pushVec.overlap;
-    p.y += pushVec.ny * pushVec.overlap;
-    const vn = p.vx * pushVec.nx + p.vy * pushVec.ny;
-    if (vn > 0) { p.vx -= vn * pushVec.nx; p.vy -= vn * pushVec.ny; }
-  }
-}
-
-// Backwards-compatible pointInsideWall (handles both rects and polygon walls)
 function pointInsideWall(x, y, margin = 6) {
   for (const w of walls) {
-    if (w.points && Array.isArray(w.points)) {
-      if (pointInPolygon(x, y, w.points)) return true;
-    } else if (typeof w.x === 'number' && typeof w.w === 'number') {
-      if (x >= w.x - margin && x <= w.x + w.w + margin && y >= w.y - margin && y <= w.y + w.h + margin) return true;
-    }
+    if (x >= w.x - margin && x <= w.x + w.w + margin && y >= w.y - margin && y <= w.y + w.h + margin) return true;
   }
   return false;
 }
 
-// spawn mob helper using new pointInsideWall
 function spawnMobAt(sp, typeName) {
   const def = mobDefs[typeName]; if (!def) return null;
-  const jitter = (CELL * 0.4) || 120;
+  const jitter = 120 * 3 / 1; // keep jitter scaled so mobs spawn in corridor areas
   const maxAttempts = 12;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const x = sp.x + (Math.random() * jitter * 2 - jitter);
     const y = sp.y + (Math.random() * jitter * 2 - jitter);
+    // clamp to map (avoid edges)
     const limit = MAP_HALF - (def.radius || 18) - 12;
     if (x < -limit || x > limit || y < -limit || y > limit) continue;
-    if (pointInsideWall(x, y, Math.max(6, def.radius * 0.5))) continue;
+    if (pointInsideWall(x, y, 8)) continue; // invalid, inside or too close to wall
     const id = 'mob_' + (nextMobId++);
     const m = { id, type: typeName, x, y, vx:0, vy:0, hp:def.maxHp, maxHp:def.maxHp, radius:def.radius, aggroRadius:650, damageContrib: {}, spawnPoint: sp, def, respawnAt: null, dead: false, stunnedUntil: 0 };
     mobs.set(id, m); return m;
   }
-  // fallback
+  // if no valid spot found, place at spawn point fallback (but offset outward until not in wall)
   let fallbackX = sp.x, fallbackY = sp.y;
   let step = 0;
   while (pointInsideWall(fallbackX, fallbackY, 8) && step < 8) {
@@ -274,7 +172,7 @@ function spawnMobAt(sp, typeName) {
   mobs.set(id, m); return m;
 }
 
-// spawn initial mobs - unchanged counts
+// spawn initial mobs - increase density (but not excessive)
 for (const sp of mobSpawnPoints) {
   const count = 4 + Math.floor(Math.random() * 3); // 4-6 per spawn point
   for (let i = 0; i < count; i++) {
@@ -316,23 +214,21 @@ const CLASS_COOLDOWNS_MS = {
 function nowMs(){ return Date.now(); }
 function randRange(min,max){ return Math.random()*(max-min)+min; }
 
-// Spawn position (choose a spawn point area)
-function spawnPosition() {
-  const sp = mobSpawnPoints[Math.floor(Math.random() * mobSpawnPoints.length)];
-  const jitter = 120 * 3 / 1;
-  for (let attempt = 0; attempt < 10; attempt++) {
-    const x = sp.x + (Math.random() * jitter * 2 - jitter);
-    const y = sp.y + (Math.random() * jitter * 2 - jitter);
-    if (!pointInsideWall(x, y, 8)) return { x, y };
-  }
-  return { x: sp.x, y: sp.y };
+// Spawn position (choose fixed bottom-left spawn)
+function bottomLeftSpawn() {
+  // bottom-left inside the outer walls: x near left edge, y near bottom edge
+  // left edge is -MAP_HALF + GAP offset in our box() logic; using CELL to place inside corridors
+  const x = -MAP_HALF + CELL * 1.5;
+  const y = MAP_HALF - CELL * 1.5;
+  return { x, y };
 }
 
 // Create runtime player. If fixedId is provided, use that as player's id.
+// Players now always spawn at bottom-left spawn point (deterministic as requested).
 function createPlayerRuntime(ws, opts = {}) {
   const fixedId = opts.id || null;
   const id = fixedId ? String(fixedId) : String(nextPlayerId++);
-  const pos = spawnPosition();
+  const pos = bottomLeftSpawn();
   const color = `hsl(${Math.floor(Math.random()*360)},70%,60%)`;
   const p = {
     id, name: opts.name || ('Player' + id),
@@ -368,7 +264,7 @@ function broadcast(obj) {
   const msg = JSON.stringify(obj);
   for (const p of players.values()) {
     if (p.ws && p.ws.readyState === WebSocket.OPEN) {
-      try { p.ws.send(msg); } catch (e) { /* ignore send error */ }
+      try { p.ws.send(msg); } catch (e) {}
     }
   }
 }
@@ -507,10 +403,7 @@ function serverTick() {
     p.x += vx * TICK_DT; p.y += vy * TICK_DT; p.vx = vx; p.vy = vy;
     const limit = MAP_HALF - p.radius - 1;
     if (p.x > limit) p.x = limit; if (p.x < -limit) p.x = -limit; if (p.y > limit) p.y = limit; if (p.y < -limit) p.y = -limit;
-    for (const w of walls) {
-      if (w.points && Array.isArray(w.points)) resolveCirclePolygon(p, w.points);
-      else resolveCircleAABB(p, w);
-    }
+    for (const w of walls) resolveCircleAABB(p, w);
     const nowSec = Date.now()/1000;
     if (p.hp > 0) {
       for (const m of mobs.values()) {
@@ -521,7 +414,7 @@ function serverTick() {
         }
       }
     } else {
-      const pos = spawnPosition(); p.x = pos.x; p.y = pos.y; p.hp = p.maxHp; p.invulnerableUntil = now + 3000;
+      const pos = bottomLeftSpawn(); p.x = pos.x; p.y = pos.y; p.hp = p.maxHp; p.invulnerableUntil = now + 3000;
     }
     p.lastSeen = now;
   }
@@ -600,11 +493,10 @@ function serverTick() {
   }
   for (const id of toRemove) projectiles.delete(id);
 
-  // broadcast snapshot (clients will now receive polygon walls)
+  // broadcast snapshot (now includes walls so clients stay authoritative)
   const playerList = Array.from(players.values()).map(p => ({ id: p.id, name: p.name, x: Math.round(p.x), y: Math.round(p.y), vx: Math.round(p.vx), vy: Math.round(p.vy), radius: p.radius, color: p.color, hp: Math.round(p.hp), maxHp: Math.round(p.maxHp), level: 1, xp: Math.round(p.xp || 0) }));
   const mobList = Array.from(mobs.values()).map(m => ({ id: m.id, type: m.type, x: Math.round(m.x), y: Math.round(m.y), hp: Math.round(m.hp), maxHp: Math.round(m.maxHp), radius: m.radius, stunnedUntil: m.stunnedUntil || 0 }));
   const projList = Array.from(projectiles.values()).map(p => ({ id: p.id, type: p.type, x: Math.round(p.x), y: Math.round(p.y), vx: Math.round(p.vx), vy: Math.round(p.vy), radius: p.radius, owner: p.ownerId, ttl: Math.max(0, p.ttl ? Math.round(p.ttl - now) : 0) }));
-  // ensure walls are safe to stringify (no functions)
   broadcast({ t:'snapshot', tick: nowMs(), players: playerList, mobs: mobList, projectiles: projList, walls });
 }
 
@@ -637,8 +529,8 @@ const heartbeatInterval = setInterval(() => {
 
 // --- WebSocket handling (guest join only) ---
 wss.on('connection', (ws, req) => {
+  // Optional origin check
   try {
-    // Optional origin check
     if (allowedOrigins && req && req.headers && req.headers.origin) {
       if (!allowedOrigins.includes(req.headers.origin)) {
         console.log('Rejecting connection from origin', req.headers.origin);
@@ -655,7 +547,6 @@ wss.on('connection', (ws, req) => {
     ws.playerId = null;
 
     ws.on('message', async (data) => {
-      // Wrap handler in try/catch to avoid silent crashes that break join flow
       try {
         const msg = JSON.parse(data);
         if (!msg || !msg.t) return;
@@ -666,16 +557,13 @@ wss.on('connection', (ws, req) => {
             const name = (msg.name && String(msg.name).slice(0,24)) || ('Player' + (nextPlayerId++));
             const p = createPlayerRuntime(ws, { name, class: (msg.class || 'warrior') });
             ws.authenticated = true; ws.playerId = p.id;
-            // send welcome (wrapped in try to avoid throw)
+            // send welcome
             try {
-              const welcomeMsg = { t:'welcome', id: p.id, mapHalf: MAP_HALF, mapSize: MAP_SIZE, mapType: MAP_TYPE, mapRadius: MAP_HALF, tickRate: TICK_RATE, spawnX: p.x, spawnY: p.y, walls, player: { class: p.class, level: 1, xp: p.xp } };
-              ws.send(JSON.stringify(welcomeMsg));
-            } catch (e) {
-              console.error('Failed to send welcome:', e);
-            }
+              ws.send(JSON.stringify({ t:'welcome', id: p.id, mapHalf: MAP_HALF, mapSize: MAP_SIZE, mapType: MAP_TYPE, mapRadius: MAP_HALF, tickRate: TICK_RATE, spawnX: p.x, spawnY: p.y, walls, player: { class: p.class, level: 1, xp: p.xp } }));
+            } catch (e) {}
             return;
           } else {
-            try { ws.send(JSON.stringify({ t: 'need_join' })); } catch (e) { /* ignore */ }
+            try { ws.send(JSON.stringify({ t: 'need_join' })); } catch (e) {}
             return;
           }
         }
@@ -703,13 +591,177 @@ wss.on('connection', (ws, req) => {
         } else if (msg.t === 'ping') {
           try { ws.send(JSON.stringify({ t: 'pong', ts: msg.ts || Date.now() })); } catch(e){}
         } else if (msg.t === 'cast') {
-          // (cast handling left unchanged for brevity — same as before)
-          // ... existing cast handling logic here ...
-          // For clarity in this patch we keep the same detailed cast logic as the previous server.
+          // Server-side authoritative cast handling
+          const slot = Math.max(1, Math.min(4, Number(msg.slot || 1)));
+          const cls = String(msg.class || player.class || 'warrior');
+          const now = Date.now();
+          // cooldown check
+          player.cooldowns = player.cooldowns || {};
+          const cdKey = `s${slot}`;
+          const cooldowns = CLASS_COOLDOWNS_MS[cls] || [6000,6000,6000,6000];
+          const cdUntil = player.cooldowns[cdKey] || 0;
+          if (now < cdUntil) {
+            // still cooling, ignore
+            try { ws.send(JSON.stringify({ t:'cast_rejected', reason:'cooldown', slot })); } catch(e){}
+            return;
+          }
+          // basic validation: alive
+          if (player.hp <= 0) return;
+          // get skill def
+          const defs = SKILL_DEFS[cls] || SKILL_DEFS['warrior'];
+          const def = defs[Math.max(0, Math.min(slot-1, defs.length-1))];
+          if (!def) return;
+          // set cooldown
+          const cdMs = cooldowns[Math.max(0, slot-1)] || 6000;
+          player.cooldowns[cdKey] = now + cdMs;
+
+          // get angle from client if present (validate)
+          let angle = 0;
+          if (typeof msg.angle === 'number' && isFinite(msg.angle)) angle = Number(msg.angle);
+
+          // optional targetId or point (aimX/aimY)
+          const targetId = (typeof msg.targetId !== 'undefined') ? String(msg.targetId) : null;
+          const aimX = (typeof msg.aimX === 'number') ? Number(msg.aimX) : null;
+          const aimY = (typeof msg.aimY === 'number') ? Number(msg.aimY) : null;
+
+          // helper: compute caster damage multiplier
+          let casterDamageMul = 1.0;
+          if (player.buffs && player.buffs.length) {
+            for (const b of player.buffs) if (b.type === 'damage' && b.until > now) casterDamageMul *= (b.multiplier || 1);
+          }
+
+          // create effects / projectiles according to def.kind
+          if (def.kind === 'aoe_stun') {
+            // immediate aoe stun centered on player
+            const ax = player.x, ay = player.y;
+            // damage mobs
+            for (const m of mobs.values()) {
+              if (m.hp <= 0) continue;
+              const d = Math.hypot(m.x - ax, m.y - ay);
+              if (d <= def.radius + (m.radius || 12)) {
+                damageMob(m, def.damage, player.id);
+                m.stunnedUntil = now + (def.stunMs || 3000);
+                broadcast({ t:'stun', id: m.id, kind: 'mob', until: m.stunnedUntil, sourceId: player.id });
+              }
+            }
+            // damage players (PvP)
+            for (const p of players.values()) {
+              if (String(p.id) === String(player.id)) continue;
+              if (p.hp <= 0) continue;
+              const d = Math.hypot(p.x - ax, p.y - ay);
+              if (d <= def.radius + (p.radius || 12)) {
+                applyDamageToPlayer(p, def.damage, player.id);
+                p.stunnedUntil = now + (def.stunMs || 3000);
+                broadcast({ t:'stun', id: p.id, kind: 'player', until: p.stunnedUntil, sourceId: player.id });
+              }
+            }
+            // notify clients of cast effect
+            broadcast({ t: 'cast_effect', casterId: player.id, casterName: player.name, type: def.type || 'aoe', skill: def.type || 'aoe', x: Math.round(ax), y: Math.round(ay), radius: def.radius, damage: def.damage, buff: null });
+          } else if (def.kind === 'melee') {
+            // melee single-target
+            const range = def.range || 48;
+            let closest = null;
+            let closestD = Infinity;
+            for (const m of mobs.values()) {
+              if (m.hp <= 0) continue;
+              const d = Math.hypot(m.x - player.x, m.y - player.y);
+              if (d <= range + (m.radius || 12) && d < closestD) { closestD = d; closest = m; }
+            }
+            if (closest) {
+              damageMob(closest, def.damage * casterDamageMul, player.id);
+              broadcast({ t: 'cast_effect', casterId: player.id, casterName: player.name, type: def.type || 'melee', skill: def.type || 'melee', x: Math.round(player.x), y: Math.round(player.y), range, damage: def.damage });
+            } else {
+              for (const p2 of players.values()) {
+                if (String(p2.id) === String(player.id)) continue;
+                if (p2.hp <= 0) continue;
+                const d = Math.hypot(p2.x - player.x, p2.y - player.y);
+                if (d <= range + (p2.radius || 12) && d < closestD) { closestD = d; closest = p2; }
+              }
+              if (closest && closest.id) {
+                applyDamageToPlayer(closest, def.damage * casterDamageMul, player.id);
+                broadcast({ t: 'cast_effect', casterId: player.id, casterName: player.name, type: def.type || 'melee', skill: def.type || 'melee', x: Math.round(player.x), y: Math.round(player.y), range, damage: def.damage });
+              }
+            }
+          } else if (def.kind === 'buff') {
+            const b = def.buff;
+            if (b) {
+              player.buffs = player.buffs || [];
+              player.buffs.push({ type: b.type, until: now + (b.durationMs || 0), multiplier: b.multiplier || 1.0 });
+              broadcast({ t:'cast_effect', casterId: player.id, casterName: player.name, type: def.type, skill: def.type, buff: b, x: Math.round(player.x), y: Math.round(player.y) });
+            }
+          } else if (def.kind === 'proj_target' || def.kind === 'proj_target_stun' || def.kind === 'proj_target_explode') {
+            // target required
+            if (!targetId) { try { ws.send(JSON.stringify({ t:'cast_rejected', reason:'no_target', slot })); } catch(e){} return; }
+            // find target (player or mob)
+            let targetEnt = null;
+            if (mobs.has(targetId)) { targetEnt = mobs.get(targetId); }
+            else if (players.has(targetId)) { targetEnt = players.get(targetId); }
+            else { try { ws.send(JSON.stringify({ t:'cast_rejected', reason:'invalid_target', slot })); } catch(e){} return; }
+            // compute angle to current target position
+            const tx = targetEnt.x, ty = targetEnt.y;
+            const angleToTarget = Math.atan2(ty - player.y, tx - player.x);
+            const speed = def.speed || 500;
+            const vx = Math.cos(angleToTarget) * speed;
+            const vy = Math.sin(angleToTarget) * speed;
+            const id = 'proj_' + (nextProjId++);
+            const ttl = (def.ttlMs ? now + def.ttlMs : now + 3000);
+            const proj = { id, type: def.type || 'proj', x: player.x, y: player.y, vx, vy, radius: def.radius || 6, ownerId: player.id, damage: (def.damage || 10) * casterDamageMul, ttl, kind: 'target', targetId: targetId, stunMs: def.stunMs || 0 };
+            projectiles.set(id, proj);
+            broadcast({ t:'cast_effect', casterId: player.id, casterName: player.name, type: def.type, skill: def.type, x: Math.round(player.x), y: Math.round(player.y), targetId });
+          } else if (def.kind === 'proj_burst') {
+            const aimAngle = (typeof msg.angle === 'number') ? Number(msg.angle) : 0;
+            const count = def.count || 3;
+            const spread = (def.spreadDeg || 12) * Math.PI / 180;
+            for (let n = 0; n < count; n++) {
+              const offset = ((n - (count-1)/2) / (count-1)) * spread;
+              const angle = aimAngle + offset + (Math.random()*0.02 - 0.01);
+              const speed = def.speed || 500;
+              const vx = Math.cos(angle) * speed, vy = Math.sin(angle) * speed;
+              const id = 'proj_' + (nextProjId++);
+              const ttl = (def.ttlMs ? now + def.ttlMs : now + 3000);
+              const proj = { id, type: def.type || 'proj', x: player.x, y: player.y, vx, vy, radius: def.radius || 6, ownerId: player.id, damage: (def.damage || 10) * casterDamageMul, ttl, kind: 'burst' };
+              projectiles.set(id, proj);
+            }
+            broadcast({ t:'cast_effect', casterId: player.id, casterName: player.name, type: def.type, skill: def.type, x: Math.round(player.x), y: Math.round(player.y) });
+          } else if (def.kind === 'proj_aoe_spread') {
+            let aimAngle = (typeof msg.angle === 'number') ? Number(msg.angle) : 0;
+            if (typeof aimX === 'number' && typeof aimY === 'number') {
+              aimAngle = Math.atan2(aimY - player.y, aimX - player.x);
+            }
+            const count = def.count || 5;
+            const spread = (def.spreadDeg || 45) * Math.PI / 180;
+            for (let n = 0; n < count; n++) {
+              const offset = (Math.random() - 0.5) * spread;
+              const angle = aimAngle + offset;
+              const speed = def.speed || 400;
+              const vx = Math.cos(angle) * speed, vy = Math.sin(angle) * speed;
+              const id = 'proj_' + (nextProjId++);
+              const ttl = (def.ttlMs ? now + def.ttlMs : now + 3000);
+              const proj = { id, type: def.type || 'proj', x: player.x, y: player.y, vx, vy, radius: def.radius || 6, ownerId: player.id, damage: (def.damage || 10) * casterDamageMul, ttl, kind: 'arcane' };
+              projectiles.set(id, proj);
+            }
+            broadcast({ t:'cast_effect', casterId: player.id, casterName: player.name, type: def.type, skill: def.type, x: Math.round(player.x), y: Math.round(player.y) });
+          } else {
+            // fallback aoe
+            const ax = player.x, ay = player.y;
+            for (const m of mobs.values()) {
+              if (m.hp <= 0) continue;
+              const d = Math.hypot(m.x - ax, m.y - ay);
+              if (d <= (def.radius || 48) + (m.radius || 12)) damageMob(m, def.damage * casterDamageMul, player.id);
+            }
+            for (const p of players.values()) {
+              if (String(p.id) === String(player.id)) continue;
+              if (p.hp <= 0) continue;
+              const d = Math.hypot(p.x - ax, p.y - ay);
+              if (d <= (def.radius || 48) + (p.radius || 12)) applyDamageToPlayer(p, def.damage * casterDamageMul, player.id);
+            }
+            broadcast({ t:'cast_effect', casterId: player.id, casterName: player.name, type: def.type, skill: def.type, x: Math.round(ax), y: Math.round(ay), radius: def.radius, damage: def.damage });
+          }
         }
       } catch (err) {
-        console.error('Error in ws.on(message):', err);
-        try { ws.send(JSON.stringify({ t: 'server_error', reason: String(err && err.message ? err.message : err) })); } catch(e){}
+        // avoid throwing out of the message handler
+        console.error('Error handling WS message:', err);
+        try { ws.send(JSON.stringify({ t: 'server_error', error: String(err && err.message ? err.message : err) })); } catch(e){}
       }
     });
 
@@ -722,7 +774,6 @@ wss.on('connection', (ws, req) => {
 
     ws.on('error', (err) => {
       if (ws.playerId) players.delete(String(ws.playerId));
-      console.error('ws error for connection', err);
     });
   } catch (outerErr) {
     console.error('Unhandled error in connection handler:', outerErr);
