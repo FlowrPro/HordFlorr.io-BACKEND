@@ -310,6 +310,12 @@ function damageMob(mob, amount, playerId) {
   if (mob.hp <= 0) return;
   mob.hp -= amount;
   if (playerId) { mob.damageContrib[playerId] = (mob.damageContrib[playerId] || 0) + amount; }
+
+  // Broadcast mob_hurt for damage numbers and immediate UI feedback
+  try {
+    broadcast({ t: 'mob_hurt', mobId: mob.id, hp: Math.max(0, Math.round(mob.hp)), damage: Math.round(amount), sourceId: playerId || null });
+  } catch (e) {}
+
   if (mob.hp <= 0) { if (!mob.respawnAt) handleMobDeath(mob, playerId); }
 }
 function handleMobDeath(mob, killerId = null) {
@@ -343,7 +349,7 @@ function applyDamageToPlayer(targetPlayer, amount, attackerId) {
     handlePlayerDeath(targetPlayer, attackerId ? { id: attackerId } : null);
     broadcast({ t: 'player_died', id: targetPlayer.id, killerId: attackerId || null });
   } else {
-    broadcast({ t: 'player_hurt', id: targetPlayer.id, hp: Math.round(targetPlayer.hp), source: attackerId || null });
+    broadcast({ t: 'player_hurt', id: targetPlayer.id, hp: Math.round(targetPlayer.hp), source: attackerId || null, damage: Math.round(amount) });
   }
 }
 function handlePlayerDeath(player, killer) {
@@ -531,13 +537,33 @@ function serverTick() {
   for (const id of toRemove) projectiles.delete(id);
 
   // broadcast snapshot including walls (polygons or boxes)
-  const playerList = Array.from(players.values()).map(p => ({ id: p.id, name: p.name, x: Math.round(p.x), y: Math.round(p.y), vx: Math.round(p.vx), vy: Math.round(p.vy), radius: p.radius, color: p.color, hp: Math.round(p.hp), maxHp: Math.round(p.maxHp), level: 1, xp: Math.round(p.xp || 0) }));
+  const playerList = Array.from(players.values()).map(p => ({ id: p.id, name: p.name, x: Math.round(p.x), y: Math.round(p.y), vx: Math.round(p.vx), vy: Math.round(p.vy), radius: p.radius, color: p.color, hp: Math.round(p.hp), maxHp: p.maxHp, level: 1, xp: Math.round(p.xp || 0) }));
   const mobList = Array.from(mobs.values()).map(m => ({ id: m.id, type: m.type, x: Math.round(m.x), y: Math.round(m.y), hp: Math.round(m.hp), maxHp: Math.round(m.maxHp), radius: m.radius, stunnedUntil: m.stunnedUntil || 0 }));
   const projList = Array.from(projectiles.values()).map(p => ({ id: p.id, type: p.type, x: Math.round(p.x), y: Math.round(p.y), vx: Math.round(p.vx), vy: Math.round(p.vy), radius: p.radius, owner: p.ownerId, ttl: Math.max(0, p.ttl ? Math.round(p.ttl - now) : 0) }));
   broadcast({ t:'snapshot', tick: nowMs(), players: playerList, mobs: mobList, projectiles: projList, walls });
 }
 
 setInterval(serverTick, Math.round(1000 / TICK_RATE));
+
+// --- Periodic server-side healing (authoritative) ---
+// Heals 10% of max HP (at least 1 HP) every 10 seconds for each alive player.
+// Broadcasts a player_healed message immediately so clients can show UI.
+const HEAL_INTERVAL_MS = 10000;
+setInterval(() => {
+  const now = Date.now();
+  for (const p of players.values()) {
+    if (!p || p.hp <= 0) continue;
+    const healAmount = Math.max(1, Math.ceil((p.maxHp || 200) * 0.10));
+    const prev = p.hp;
+    p.hp = Math.min(p.maxHp || 200, p.hp + healAmount);
+    const actual = Math.round(p.hp - prev);
+    if (actual > 0) {
+      try {
+        broadcast({ t: 'player_healed', id: p.id, hp: Math.round(p.hp), amount: actual });
+      } catch (e) {}
+    }
+  }
+}, HEAL_INTERVAL_MS);
 
 // heartbeat + cleanup
 const HEARTBEAT_INTERVAL_MS = 30000;
@@ -754,7 +780,7 @@ wss.on('connection', (ws, req) => {
             for (const m of mobs.values()) {
               if (m.hp <= 0) continue;
               const d = Math.hypot(m.x - ax, m.y - ay);
-              if (d <= (def.radius || 48) + (m.radius || 12)) damageMob(m, def.damage * casterDamageMul, player.id);
+              if (d <= (def.radius || 48) + (m.radius || 12)) damageMob(m, def.damage, player.id);
             }
             for (const p2 of players.values()) {
               if (String(p2.id) === String(player.id)) continue;
