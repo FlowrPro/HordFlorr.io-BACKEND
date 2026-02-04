@@ -268,12 +268,15 @@ function createPlayerRuntime(ws, opts = {}) {
     id, name: opts.name || ('Player' + id),
     x: pos.x, y: pos.y, vx:0, vy:0, radius:28, color,
     ws, lastInput: { x:0, y:0 }, lastSeen: nowMs(), chatTimestamps: [],
-    maxHp: 200, hp: 200, xp: 0, gold: 0,
+    maxHp: 200, hp: 200, xp: 0, nextLevelXp: 100, level: 1, gold: 0,
     lastAttackTime: 0, attackCooldown: 0.6, baseDamage: 18, invulnerableUntil: 0,
     class: opts.class || 'warrior',
     cooldowns: {},
     baseSpeed: 380,
     buffs: [],
+    // permanent progression multipliers
+    damageMul: 1.0,
+    buffDurationMul: 1.0,
     stunnedUntil: 0
   };
   players.set(String(p.id), p);
@@ -300,6 +303,49 @@ function broadcast(obj) {
     if (p.ws && p.ws.readyState === WebSocket.OPEN) {
       try { p.ws.send(msg); } catch (e) {}
     }
+  }
+}
+
+// Award XP to player and handle leveling (handles multi-level in one award)
+function awardXpToPlayer(player, amount) {
+  if (!player) return;
+  player.xp = Number(player.xp || 0) + Number(amount || 0);
+  let leveled = false;
+  let levelUps = 0;
+  // ensure nextLevelXp is set
+  player.nextLevelXp = player.nextLevelXp || 100;
+  while (player.xp >= player.nextLevelXp) {
+    const req = player.nextLevelXp;
+    player.xp -= req;
+    player.level = (player.level || 1) + 1;
+    // HP increases
+    player.maxHp = (player.maxHp || 200) + 50;
+    player.hp = Math.min(player.maxHp, (player.hp || player.maxHp) + 50);
+    // increase XP requirement by 30% (round up)
+    player.nextLevelXp = Math.ceil(req * 1.3);
+    levelUps++;
+    leveled = true;
+    // every 5 levels, permanently increase damage and buff duration
+    if ((player.level % 5) === 0) {
+      player.damageMul = (player.damageMul || 1) * 1.3;
+      player.buffDurationMul = (player.buffDurationMul || 1) * 1.1;
+    }
+  }
+  if (leveled) {
+    try {
+      broadcast({
+        t: 'player_levelup',
+        playerName: player.name,
+        level: player.level,
+        hpGain: 50 * levelUps,
+        newHp: Math.round(player.hp),
+        newMaxHp: Math.round(player.maxHp),
+        xp: Math.round(player.xp || 0),
+        nextLevelXp: Math.round(player.nextLevelXp || 100),
+        damageMul: player.damageMul || 1,
+        buffDurationMul: player.buffDurationMul || 1
+      });
+    } catch (e) {}
   }
 }
 
@@ -333,7 +379,9 @@ function handleMobDeath(mob, killerId = null) {
   if (topId && players.has(String(topId))) {
     const killer = players.get(String(topId));
     killer.gold = Number(killer.gold||0) + gold;
-    killer.xp = Number(killer.xp||0) + xp;
+    // Award XP via helper that handles level-ups
+    awardXpToPlayer(killer, xp);
+    // Also broadcast mob_died
     broadcast({ t:'mob_died', mobId: mob.id, mobType: mob.type, killerId: killer.id, gold, xp });
   } else {
     broadcast({ t:'mob_died', mobId: mob.id, mobType: mob.type, killerId: null, gold:0, xp:0 });
@@ -416,6 +464,9 @@ function serverTick() {
     let speedMultiplier = 1.0; let damageMultiplier = 1.0;
     for (const b of p.buffs) { speedMultiplier *= (b.multiplier || 1.0); if (b.type === 'damage') damageMultiplier *= (b.multiplier || 1.0); }
 
+    // include permanent damage multiplier
+    damageMultiplier = damageMultiplier * (p.damageMul || 1.0);
+
     if (p.stunnedUntil && nowMsVal < p.stunnedUntil) { p.vx = 0; p.vy = 0; p.lastSeen = now; continue; }
 
     const inVec = p.lastInput || { x:0, y:0 }; const speed = (p.baseSpeed || 380) * speedMultiplier; const vx = inVec.x * speed, vy = inVec.y * speed;
@@ -473,7 +524,7 @@ function serverTick() {
     if (p.hp > 0) {
       for (const m of mobs.values()) {
         if (m.hp <= 0) continue;
-        const d = Math.hypot(m.x - p.x, m.y - p.y); const range = p.radius + m.radius + 8;
+        const d = Math.hypot(m.x - p.x, m.y - p.y); const range = p.radius + m.radius + 6;
         if (d <= range) {
           if (nowSec - (p.lastAttackTime || 0) >= p.attackCooldown) { p.lastAttackTime = nowSec; const dmg = p.baseDamage * (damageMultiplier || 1.0); damageMob(m, dmg, p.id); }
         }
@@ -537,7 +588,7 @@ function serverTick() {
   for (const id of toRemove) projectiles.delete(id);
 
   // broadcast snapshot including walls (polygons or boxes)
-  const playerList = Array.from(players.values()).map(p => ({ id: p.id, name: p.name, x: Math.round(p.x), y: Math.round(p.y), vx: Math.round(p.vx), vy: Math.round(p.vy), radius: p.radius, color: p.color, hp: Math.round(p.hp), maxHp: p.maxHp, level: 1, xp: Math.round(p.xp || 0) }));
+  const playerList = Array.from(players.values()).map(p => ({ id: p.id, name: p.name, x: Math.round(p.x), y: Math.round(p.y), vx: Math.round(p.vx), vy: Math.round(p.vy), radius: p.radius, color: p.color, hp: Math.round(p.hp), maxHp: p.maxHp, level: p.level, xp: Math.round(p.xp || 0), nextLevelXp: p.nextLevelXp || 100 }));
   const mobList = Array.from(mobs.values()).map(m => ({ id: m.id, type: m.type, x: Math.round(m.x), y: Math.round(m.y), hp: Math.round(m.hp), maxHp: Math.round(m.maxHp), radius: m.radius, stunnedUntil: m.stunnedUntil || 0 }));
   const projList = Array.from(projectiles.values()).map(p => ({ id: p.id, type: p.type, x: Math.round(p.x), y: Math.round(p.y), vx: Math.round(p.vx), vy: Math.round(p.vy), radius: p.radius, owner: p.ownerId, ttl: Math.max(0, p.ttl ? Math.round(p.ttl - now) : 0) }));
   broadcast({ t:'snapshot', tick: nowMs(), players: playerList, mobs: mobList, projectiles: projList, walls });
@@ -617,7 +668,7 @@ wss.on('connection', (ws, req) => {
             const p = createPlayerRuntime(ws, { name, class: (msg.class || 'warrior') });
             ws.authenticated = true; ws.playerId = p.id;
             try {
-              ws.send(JSON.stringify({ t:'welcome', id: p.id, mapHalf: MAP_HALF, mapSize: MAP_SIZE, mapType: MAP_TYPE, mapRadius: MAP_HALF, tickRate: TICK_RATE, spawnX: p.x, spawnY: p.y, walls, player: { class: p.class, level: 1, xp: p.xp } }));
+              ws.send(JSON.stringify({ t:'welcome', id: p.id, mapHalf: MAP_HALF, mapSize: MAP_SIZE, mapType: MAP_TYPE, mapRadius: MAP_HALF, tickRate: TICK_RATE, spawnX: p.x, spawnY: p.y, walls, player: { class: p.class, level: p.level, xp: p.xp, nextLevelXp: p.nextLevelXp } }));
             } catch (e) {}
             return;
           } else {
@@ -670,9 +721,11 @@ wss.on('connection', (ws, req) => {
           const aimX = (typeof msg.aimX === 'number') ? Number(msg.aimX) : null;
           const aimY = (typeof msg.aimY === 'number') ? Number(msg.aimY) : null;
 
-          let casterDamageMul = 1.0;
+          // include permanent damage multiplier
+          let casterDamageMul = Number(player.damageMul || 1.0);
+          // include active buff multipliers on top
           if (player.buffs && player.buffs.length) {
-            for (const b of player.buffs) if (b.type === 'damage' && b.until > now) casterDamageMul *= (b.multiplier || 1);
+            for (const b of player.buffs) if (b.type === 'damage') casterDamageMul *= (b.multiplier || 1);
           }
 
           // handle kinds (same logic used previously; ensures projectiles are created)
@@ -682,7 +735,7 @@ wss.on('connection', (ws, req) => {
               if (m.hp <= 0) continue;
               const d = Math.hypot(m.x - ax, m.y - ay);
               if (d <= def.radius + (m.radius || 12)) {
-                damageMob(m, def.damage, player.id);
+                damageMob(m, def.damage * casterDamageMul, player.id);
                 m.stunnedUntil = now + (def.stunMs || 3000);
                 broadcast({ t:'stun', id: m.id, kind: 'mob', until: m.stunnedUntil, sourceId: player.id });
               }
@@ -692,7 +745,7 @@ wss.on('connection', (ws, req) => {
               if (p.hp <= 0) continue;
               const d = Math.hypot(p.x - ax, p.y - ay);
               if (d <= def.radius + (p.radius || 12)) {
-                applyDamageToPlayer(p, def.damage, player.id);
+                applyDamageToPlayer(p, def.damage * casterDamageMul, player.id);
                 p.stunnedUntil = now + (def.stunMs || 3000);
                 broadcast({ t:'stun', id: p.id, kind: 'player', until: p.stunnedUntil, sourceId: player.id });
               }
@@ -725,8 +778,11 @@ wss.on('connection', (ws, req) => {
             const b = def.buff;
             if (b) {
               player.buffs = player.buffs || [];
-              player.buffs.push({ type: b.type, until: now + (b.durationMs || 0), multiplier: b.multiplier || 1.0 });
-              broadcast({ t:'cast_effect', casterId: player.id, casterName: player.name, type: def.type, skill: def.type, buff: b, x: Math.round(player.x), y: Math.round(player.y) });
+              // apply buffDurationMul to duration
+              const actualDurationMs = Math.round((b.durationMs || 0) * (player.buffDurationMul || 1.0));
+              player.buffs.push({ type: b.type, until: now + (actualDurationMs || 0), multiplier: b.multiplier || 1.0 });
+              // Broadcast buff payload including its actual durationMs
+              broadcast({ t:'cast_effect', casterId: player.id, casterName: player.name, type: def.type, skill: def.type, buff: { type: b.type, multiplier: b.multiplier || 1.0, durationMs: actualDurationMs }, x: Math.round(player.x), y: Math.round(player.y) });
             }
           } else if (def.kind === 'proj_target' || def.kind === 'proj_target_stun' || def.kind === 'proj_target_explode') {
             if (!targetId) { try { ws.send(JSON.stringify({ t:'cast_rejected', reason:'no_target', slot })); } catch(e){} return; }
@@ -780,7 +836,7 @@ wss.on('connection', (ws, req) => {
             for (const m of mobs.values()) {
               if (m.hp <= 0) continue;
               const d = Math.hypot(m.x - ax, m.y - ay);
-              if (d <= (def.radius || 48) + (m.radius || 12)) damageMob(m, def.damage, player.id);
+              if (d <= (def.radius || 48) + (m.radius || 12)) damageMob(m, def.damage * casterDamageMul, player.id);
             }
             for (const p2 of players.values()) {
               if (String(p2.id) === String(player.id)) continue;
