@@ -154,24 +154,35 @@ const mobDefs = {
   boar:   { name: 'Boar',   maxHp: 150, atk: 18, speed: 150, xp: 16, goldMin: 8, goldMax: 16, respawn: 14, radius: 24 }
 };
 
-// We'll replace the previous spawn layout and put clusters at the purple markers.
-// Each coordinate below is a grid square in [-10..10] space where center is (0,0).
-// They are mapped to world coordinates by multiplying by (MAP_SIZE / 20).
+// We'll replace previous spawn layout with clusters precisely at the purple markers from your updated image.
+// Each cluster will spawn 10 mobs. Coordinates are grid integers in [-10..10] with center = (0,0).
+// Convert grid (sx,sy) -> world (sx * (MAP_SIZE / 20), sy * (MAP_SIZE / 20))
+// Updated purple grid coordinates (moved according to your adjustments)
 const purpleGridCoords = [
-  [-1, 9],
-  [3, 9],
-  [5, 5],
-  [7, 3],
-  [7, 0],
-  [5, -4],
-  [1, -6],
-  [-3, -5],
-  [-6, -2],
-  [-6, 4],
-  [-2, 3]
+  // top-left moved up more
+  [-3, 10],
+  // top-middle moved up more
+  [3, 10],
+  // top-right cluster
+  [8, 6],
+  // middle cluster moved down
+  [5, 2],
+  // cluster slightly left of center
+  [1, -1],
+  // lower-right
+  [4, -4],
+  // lower-left cluster
+  [-2, -5],
+  // bottom-left-ish
+  [-6, -3],
+  // left-middle up a bit
+  [-7, 1],
+  // left-upper
+  [-6, 5],
+  // small middle-upper
+  [-1, 4]
 ];
 
-// Build mobSpawnPoints from purpleGridCoords. Each spawn uses a mix of mob types.
 const mobSpawnPoints = [];
 const squareWorld = MAP_SIZE / 20; // world units per grid square
 for (const [sx, sy] of purpleGridCoords) {
@@ -227,7 +238,7 @@ function spawnMobAt(sp, typeName) {
   mobs.set(id, m); return m;
 }
 
-// spawn initial mobs — now spawn cluster (10 mobs) at each purple spawn point
+// spawn initial mobs — clusterCount per spawn point (10 each)
 for (const sp of mobSpawnPoints) {
   const clusterCount = 10;
   for (let i = 0; i < clusterCount; i++) {
