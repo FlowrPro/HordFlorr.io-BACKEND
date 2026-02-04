@@ -154,29 +154,30 @@ const mobDefs = {
   boar:   { name: 'Boar',   maxHp: 150, atk: 18, speed: 150, xp: 16, goldMin: 8, goldMax: 16, respawn: 14, radius: 24 }
 };
 
-// Existing spawn points (kept from original layout)
-const mobSpawnPoints = [
-  { x: -MAP_HALF + CELL * 2 + CELL/2, y: -MAP_HALF + CELL*2 + CELL/2, types: ['goblin','slime','boar'] },
-  { x: -MAP_HALF + CELL * 6 + CELL/2, y: -MAP_HALF + CELL*6 + CELL/2, types: ['wolf','goblin','boar'] },
-  { x: -MAP_HALF + CELL * 10 + CELL/2, y: -MAP_HALF + CELL*3 + CELL/2, types: ['goblin','slime','boar'] },
-  { x: -MAP_HALF + CELL * 3 + CELL/2, y: -MAP_HALF + CELL*9 + CELL/2, types: ['slime','goblin','boar'] },
-  { x: -MAP_HALF + CELL * 9 + CELL/2, y: -MAP_HALF + CELL*8 + CELL/2, types: ['wolf','goblin','boar'] },
-  { x: -MAP_HALF + CELL * 5 + CELL/2, y: -MAP_HALF + CELL*2 + CELL/2, types: ['slime','goblin'] },
-  { x: -MAP_HALF + CELL * 2 + CELL/2, y: -MAP_HALF + CELL*8 + CELL/2, types: ['goblin','wolf'] }
+// We'll replace the previous spawn layout and put clusters at the purple markers.
+// Each coordinate below is a grid square in [-10..10] space where center is (0,0).
+// They are mapped to world coordinates by multiplying by (MAP_SIZE / 20).
+const purpleGridCoords = [
+  [-1, 9],
+  [3, 9],
+  [5, 5],
+  [7, 3],
+  [7, 0],
+  [5, -4],
+  [1, -6],
+  [-3, -5],
+  [-6, -2],
+  [-6, 4],
+  [-2, 3]
 ];
 
-// Add a cluster at grid square (-6, 8).
-// The coordinate system: center is (0,0) and the map diameter is divided into 20 squares.
-// Square coordinate (sx, sy) maps to world coordinate (sx * (MAP_SIZE/20), sy * (MAP_SIZE/20)).
-try {
-  const squareWorld = MAP_SIZE / 20;
-  const clusterX = -6 * squareWorld;
-  const clusterY = 8 * squareWorld;
-  // Add a spawn point with multiple mob types to create a noticeable cluster.
-  mobSpawnPoints.push({ x: clusterX, y: clusterY, types: ['goblin', 'wolf', 'boar', 'slime'] });
-} catch (err) {
-  // if any math fails, ignore gracefully
-  console.warn('Failed to add cluster spawn point:', err);
+// Build mobSpawnPoints from purpleGridCoords. Each spawn uses a mix of mob types.
+const mobSpawnPoints = [];
+const squareWorld = MAP_SIZE / 20; // world units per grid square
+for (const [sx, sy] of purpleGridCoords) {
+  const wx = sx * squareWorld;
+  const wy = sy * squareWorld;
+  mobSpawnPoints.push({ x: wx, y: wy, types: ['goblin', 'wolf', 'boar', 'slime'] });
 }
 
 function pointInsideWall(x, y, margin = 6) {
@@ -226,12 +227,12 @@ function spawnMobAt(sp, typeName) {
   mobs.set(id, m); return m;
 }
 
-// spawn initial mobs
+// spawn initial mobs — now spawn cluster (10 mobs) at each purple spawn point
 for (const sp of mobSpawnPoints) {
-  const count = 4 + Math.floor(Math.random() * 3);
-  for (let i = 0; i < count; i++) {
-    const t = sp.types[Math.floor(Math.random() * sp.types.length)];
-    spawnMobAt(sp, t);
+  const clusterCount = 10;
+  for (let i = 0; i < clusterCount; i++) {
+    const choice = sp.types[Math.floor(Math.random() * sp.types.length)];
+    spawnMobAt(sp, choice);
   }
 }
 
