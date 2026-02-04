@@ -154,25 +154,30 @@ const mobDefs = {
   boar:   { name: 'Boar',   maxHp: 150, atk: 18, speed: 150, xp: 16, goldMin: 8, goldMax: 16, respawn: 14, radius: 24 }
 };
 
-// NEW: Replace old spawn points with new coordinates (these correspond to the purple marks in your image).
-// Each spawn entry uses gridToWorldCenter(col, row). Adjust grid cells if you want different placements.
+// Existing spawn points (kept from original layout)
 const mobSpawnPoints = [
-  { x: gridToWorldCenter(2,2).x, y: gridToWorldCenter(2,2).y, types: ['goblin','slime','boar'] },
-  { x: gridToWorldCenter(2,4).x, y: gridToWorldCenter(2,4).y, types: ['goblin','slime','boar'] },
-  { x: gridToWorldCenter(2,6).x, y: gridToWorldCenter(2,6).y, types: ['goblin','slime','boar'] },
-  { x: gridToWorldCenter(2,8).x, y: gridToWorldCenter(2,8).y, types: ['goblin','slime','boar'] },
-
-  { x: gridToWorldCenter(4,2).x, y: gridToWorldCenter(4,2).y, types: ['goblin','boar'] },
-  { x: gridToWorldCenter(4,6).x, y: gridToWorldCenter(4,6).y, types: ['wolf','goblin','boar'] },
-  { x: gridToWorldCenter(4,10).x, y: gridToWorldCenter(4,10).y, types: ['slime','goblin','boar'] },
-
-  { x: gridToWorldCenter(6,4).x, y: gridToWorldCenter(6,4).y, types: ['wolf','goblin'] },
-  { x: gridToWorldCenter(6,8).x, y: gridToWorldCenter(6,8).y, types: ['goblin','slime','boar'] },
-
-  { x: gridToWorldCenter(8,2).x, y: gridToWorldCenter(8,2).y, types: ['goblin','slime'] },
-  { x: gridToWorldCenter(8,6).x, y: gridToWorldCenter(8,6).y, types: ['wolf','goblin','boar'] },
-  { x: gridToWorldCenter(10,10).x, y: gridToWorldCenter(10,10).y, types: ['goblin','boar'] }
+  { x: -MAP_HALF + CELL * 2 + CELL/2, y: -MAP_HALF + CELL*2 + CELL/2, types: ['goblin','slime','boar'] },
+  { x: -MAP_HALF + CELL * 6 + CELL/2, y: -MAP_HALF + CELL*6 + CELL/2, types: ['wolf','goblin','boar'] },
+  { x: -MAP_HALF + CELL * 10 + CELL/2, y: -MAP_HALF + CELL*3 + CELL/2, types: ['goblin','slime','boar'] },
+  { x: -MAP_HALF + CELL * 3 + CELL/2, y: -MAP_HALF + CELL*9 + CELL/2, types: ['slime','goblin','boar'] },
+  { x: -MAP_HALF + CELL * 9 + CELL/2, y: -MAP_HALF + CELL*8 + CELL/2, types: ['wolf','goblin','boar'] },
+  { x: -MAP_HALF + CELL * 5 + CELL/2, y: -MAP_HALF + CELL*2 + CELL/2, types: ['slime','goblin'] },
+  { x: -MAP_HALF + CELL * 2 + CELL/2, y: -MAP_HALF + CELL*8 + CELL/2, types: ['goblin','wolf'] }
 ];
+
+// Add a cluster at grid square (-6, 8).
+// The coordinate system: center is (0,0) and the map diameter is divided into 20 squares.
+// Square coordinate (sx, sy) maps to world coordinate (sx * (MAP_SIZE/20), sy * (MAP_SIZE/20)).
+try {
+  const squareWorld = MAP_SIZE / 20;
+  const clusterX = -6 * squareWorld;
+  const clusterY = 8 * squareWorld;
+  // Add a spawn point with multiple mob types to create a noticeable cluster.
+  mobSpawnPoints.push({ x: clusterX, y: clusterY, types: ['goblin', 'wolf', 'boar', 'slime'] });
+} catch (err) {
+  // if any math fails, ignore gracefully
+  console.warn('Failed to add cluster spawn point:', err);
+}
 
 function pointInsideWall(x, y, margin = 6) {
   for (const w of walls) {
@@ -223,8 +228,7 @@ function spawnMobAt(sp, typeName) {
 
 // spawn initial mobs
 for (const sp of mobSpawnPoints) {
-  // Each spawnplace spawns exactly 10 mobs (user request)
-  const count = 10;
+  const count = 4 + Math.floor(Math.random() * 3);
   for (let i = 0; i < count; i++) {
     const t = sp.types[Math.floor(Math.random() * sp.types.length)];
     spawnMobAt(sp, t);
@@ -473,7 +477,7 @@ function serverTick() {
     const nowMsVal = nowMs();
     p.buffs = (p.buffs || []).filter(b => b.until > nowMsVal);
     let speedMultiplier = 1.0; let damageMultiplier = 1.0;
-    for (const b of p.buffs) { speedMultiplier *= (b.multiplier || 1.0); if (b.type === 'damage') damageMultiplier *= (b.multiplier || 1.0); }
+    for (const b of p.buffs) { speedMultiplier *= (b.multiplier || 1); if (b.type === 'damage') damageMultiplier *= (b.multiplier || 1); }
 
     // include permanent damage multiplier
     damageMultiplier = damageMultiplier * (p.damageMul || 1.0);
