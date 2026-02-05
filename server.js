@@ -150,10 +150,12 @@ try {
 }
 
 // --- Mob defs & spawn points ---
+// UPDATED: goblin and wolf radii set to previous golem size (40).
+// Golem made slightly larger (+6) -> 46.
 const mobDefs = {
-  goblin: { name: 'Goblin', maxHp: 120, atk: 14, speed: 140, xp: 12, goldMin: 6, goldMax: 14, respawn: 12, radius: 22 },
-  wolf:   { name: 'Wolf',   maxHp: 180, atk: 20, speed: 170, xp: 20, goldMin: 12, goldMax: 20, respawn: 18, radius: 26 },
-  golem:  { name: 'Golem',  maxHp: 420, atk: 34, speed: 60,  xp: 60, goldMin: 20, goldMax: 40, respawn: 25, radius: 40 }
+  goblin: { name: 'Goblin', maxHp: 120, atk: 14, speed: 140, xp: 12, goldMin: 6, goldMax: 14, respawn: 12, radius: 40 },
+  wolf:   { name: 'Wolf',   maxHp: 180, atk: 20, speed: 170, xp: 20, goldMin: 12, goldMax: 20, respawn: 18, radius: 40 },
+  golem:  { name: 'Golem',  maxHp: 420, atk: 34, speed: 60,  xp: 60, goldMin: 20, goldMax: 40, respawn: 25, radius: 46 }
 };
 
 // We'll replace previous spawn layout with clusters precisely at the purple markers from your updated image.
