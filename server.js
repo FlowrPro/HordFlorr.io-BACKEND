@@ -153,8 +153,6 @@ try {
 const mobDefs = {
   goblin: { name: 'Goblin', maxHp: 120, atk: 14, speed: 140, xp: 12, goldMin: 6, goldMax: 14, respawn: 12, radius: 22 },
   wolf:   { name: 'Wolf',   maxHp: 180, atk: 20, speed: 170, xp: 20, goldMin: 12, goldMax: 20, respawn: 18, radius: 26 },
-  slime:  { name: 'Slime',  maxHp: 80,  atk: 8,  speed: 100, xp: 6,  goldMin: 2,  goldMax: 6,  respawn: 10, radius: 18 },
-  boar:   { name: 'Boar',   maxHp: 150, atk: 18, speed: 150, xp: 16, goldMin: 8, goldMax: 16, respawn: 14, radius: 24 },
   golem:  { name: 'Golem',  maxHp: 420, atk: 34, speed: 60,  xp: 60, goldMin: 20, goldMax: 40, respawn: 25, radius: 40 }
 };
 
@@ -243,7 +241,7 @@ function spawnMobAt(sp, typeName) {
   mobs.set(id, m); return m;
 }
 
-// spawn initial mobs — for each spawn point, spawn 5 goblins, 2 golems, 3 wolves
+// spawn initial mobs — clusterCount per spawn point (5 goblins, 2 golems, 3 wolves)
 for (const sp of mobSpawnPoints) {
   // 5 goblins
   for (let i = 0; i < 5; i++) spawnMobAt(sp, 'goblin');
@@ -554,6 +552,8 @@ function serverTick() {
     for (const w of walls) {
       if (w.points && Array.isArray(w.points)) {
         // resolve circle vs polygon (simple push using edge distances)
+        // reuse pointToSegment distance logic and push outward if overlapping edges -> simple implementation
+        // (This is a non-perfect resolution, but sufficient for preventing players entering polygon area.)
         let minOverlap = Infinity, push = null;
         for (let i = 0; i < w.points.length; i++) {
           const a = w.points[i];
@@ -569,8 +569,11 @@ function serverTick() {
           const overlap = p.radius - d;
           if (overlap > 0 && overlap < minOverlap) {
             minOverlap = overlap;
+            // compute normal
             let nx = -vy, ny = vx; const nlen = Math.hypot(nx, ny) || 1; nx /= nlen; ny /= nlen;
+            // determine correct normal sign by sampling
             const sampleX = cx + nx * 2, sampleY = cy + ny * 2;
+            // simple winding test
             let inside = false;
             for (let ii = 0, jj = w.points.length - 1; ii < w.points.length; jj = ii++) {
               const xi = w.points[ii].x, yi = w.points[ii].y;
