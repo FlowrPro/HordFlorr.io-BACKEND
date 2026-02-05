@@ -32,6 +32,9 @@ const mobs = new Map();
 const projectiles = new Map();
 let nextProjId = 1;
 
+// --- Equipment config (server-side) ---
+const EQUIP_SLOTS = 5;
+
 // --- Map helpers (grid & polygon generation) ---
 const CELL = MAP_SIZE / 12;
 const GAP = Math.floor(Math.max(24, CELL * 0.05));
@@ -304,10 +307,55 @@ function createPlayerRuntime(ws, opts = {}) {
     // permanent progression multipliers
     damageMul: 1.0,
     buffDurationMul: 1.0,
-    stunnedUntil: 0
+    stunnedUntil: 0,
+    // server-side equipment storage
+    equipment: new Array(EQUIP_SLOTS).fill(null),
+    // store authoritative base values so equipment is applied on top
+    _baseMaxHp: 200,
+    _baseBaseSpeed: 380,
+    _baseBaseDamage: 18
   };
   players.set(String(p.id), p);
   return p;
+}
+
+// --- Server-side equipment application helper ---
+function applyEquipmentBonusesForPlayer(player) {
+  if (!player) return;
+  // ensure base backups exist
+  if (typeof player._baseMaxHp !== 'number') player._baseMaxHp = player.maxHp || 200;
+  if (typeof player._baseBaseSpeed !== 'number') player._baseBaseSpeed = player.baseSpeed || 380;
+  if (typeof player._baseBaseDamage !== 'number') player._baseBaseDamage = player.baseDamage || 18;
+
+  const bonus = { maxHp: 0, baseDamage: 0, baseSpeed: 0, damageMul: 0, buffDurationMul: 0 };
+  const equipArr = Array.isArray(player.equipment) ? player.equipment : [];
+  for (const it of equipArr) {
+    if (!it || !it.stats) continue;
+    const s = it.stats;
+    if (typeof s.maxHp === 'number') bonus.maxHp += s.maxHp;
+    if (typeof s.baseDamage === 'number') bonus.baseDamage += s.baseDamage;
+    if (typeof s.baseSpeed === 'number') bonus.baseSpeed += s.baseSpeed;
+    if (typeof s.damageMul === 'number') bonus.damageMul += s.damageMul;
+    if (typeof s.buffDurationMul === 'number') bonus.buffDurationMul += s.buffDurationMul;
+  }
+
+  const prevMax = player.maxHp || player._baseMaxHp;
+  const newMax = Math.max(1, Math.round((player._baseMaxHp || 200) + bonus.maxHp));
+  const delta = newMax - prevMax;
+  player.maxHp = newMax;
+  // If the max increased, optionally heal the player by the delta (server-authoritative).
+  if (delta > 0) {
+    player.hp = Math.min(player.maxHp, (player.hp || prevMax) + delta);
+  } else {
+    // clamp down if new max is lower
+    player.hp = Math.min(player.hp || player.maxHp, player.maxHp);
+  }
+
+  player.baseDamage = Math.max(0, (player._baseBaseDamage || 18) + bonus.baseDamage);
+  player.baseSpeed = Math.max(1, (player._baseBaseSpeed || 380) + bonus.baseSpeed);
+  // store permanently-applied multipliers if needed
+  player.damageMul = Math.max(0, 1 + bonus.damageMul);
+  player.buffDurationMul = Math.max(0, 1 + bonus.buffDurationMul);
 }
 
 // --- HTTP server ---
@@ -631,6 +679,7 @@ setInterval(() => {
   const now = Date.now();
   for (const p of players.values()) {
     if (!p || p.hp <= 0) continue;
+    // use server authoritative maxHp (which now includes equipment bonuses)
     const healAmount = Math.max(1, Math.ceil((p.maxHp || 200) * 0.10));
     const prev = p.hp;
     p.hp = Math.min(p.maxHp || 200, p.hp + healAmount);
@@ -695,7 +744,7 @@ wss.on('connection', (ws, req) => {
             const p = createPlayerRuntime(ws, { name, class: (msg.class || 'warrior') });
             ws.authenticated = true; ws.playerId = p.id;
             try {
-              ws.send(JSON.stringify({ t:'welcome', id: p.id, mapHalf: MAP_HALF, mapSize: MAP_SIZE, mapType: MAP_TYPE, mapRadius: MAP_HALF, tickRate: TICK_RATE, spawnX: p.x, spawnY: p.y, walls, player: { class: p.class, level: p.level, xp: p.xp, nextLevelXp: p.nextLevelXp } }));
+              ws.send(JSON.stringify({ t:'welcome', id: p.id, mapHalf: MAP_HALF, mapSize: MAP_SIZE, mapType: MAP_TYPE, mapRadius: MAP_HALF, tickRate: TICK_RATE, spawnX: p.x, spawnY: p.y, walls, player: { class: p.class, level: p.level, xp: p.xp, nextLevelXp: p.nextLevelXp, maxHp: p.maxHp } }));
             } catch (e) {}
             return;
           } else {
@@ -873,6 +922,18 @@ wss.on('connection', (ws, req) => {
             }
             broadcast({ t:'cast_effect', casterId: player.id, casterName: player.name, type: def.type, skill: def.type, x: Math.round(ax), y: Math.round(ay), radius: def.radius, damage: def.damage });
           }
+        } else if (msg.t === 'equip') {
+          // Client notifies server about an equip/unequip action. For prototype we accept client-sent item data.
+          // Slot should be integer in [0, EQUIP_SLOTS-1]; item is either an object with stats or null to unequip.
+          const slot = Math.max(0, Math.min(EQUIP_SLOTS - 1, Number(msg.slot || 0)));
+          const item = (msg.item && typeof msg.item === 'object') ? msg.item : null;
+          player.equipment = player.equipment || new Array(EQUIP_SLOTS).fill(null);
+          if (item) player.equipment[slot] = item;
+          else player.equipment[slot] = null;
+          // Recompute bonuses server-side (authoritative)
+          applyEquipmentBonusesForPlayer(player);
+          // Optionally ack (not necessary; snapshot will reflect changes on next tick)
+          try { ws.send(JSON.stringify({ t: 'equip_ack', slot, item: player.equipment[slot] })); } catch (e) {}
         }
       } catch (err) {
         console.error('Error handling WS message:', err);
