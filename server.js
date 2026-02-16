@@ -1,6 +1,7 @@
 // Moborr.io — authoritative WebSocket server with polygon-based maze walls,
 // bottom-left fixed spawn, and full ability/projectile handling.
 // PHASE 2: Matchmaking system with mode selection, queues, and match management.
+// FFA improvements: Random spawning, kill tracking on leaderboard, player HP bars
 //
 // Run: node server.js
 // Environment:
@@ -265,6 +266,23 @@ function bottomLeftSpawn() {
   return { x, y };
 }
 
+function randomMapSpawn() {
+  // Spawn randomly around the map, avoiding walls
+  const limit = MAP_HALF - 50;
+  const maxAttempts = 20;
+  
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const x = (Math.random() * 2 - 1) * limit;
+    const y = (Math.random() * 2 - 1) * limit;
+    
+    if (!pointInsideWall(x, y, 50)) {
+      return { x, y };
+    }
+  }
+  
+  return bottomLeftSpawn();
+}
+
 // --- MATCHMAKING HELPERS ---
 function createQueue(mode) {
   if (!queues.has(mode)) {
@@ -294,7 +312,6 @@ function broadcastQueueUpdate(mode) {
 }
 
 function addPlayerToQueue(player, mode) {
-  // Remove from any existing queue first
   if (playerToQueue.has(player.id)) {
     const oldMode = playerToQueue.get(player.id);
     const oldQueue = queues.get(oldMode);
@@ -310,7 +327,6 @@ function addPlayerToQueue(player, mode) {
   
   broadcastQueueUpdate(mode);
   
-  // If we have enough players, start countdown
   if (queue.players.length >= MIN_PLAYERS_TO_START && !queue.countdownStartedAt) {
     startQueueCountdown(mode);
   }
@@ -324,7 +340,6 @@ function removePlayerFromQueue(playerId) {
     queue.players = queue.players.filter(p => p.id !== playerId);
     broadcastQueueUpdate(mode);
     
-    // If queue becomes empty, clear countdown
     if (queue.players.length === 0) {
       queue.countdownStartedAt = null;
     }
@@ -338,7 +353,6 @@ function startQueueCountdown(mode) {
   
   queue.countdownStartedAt = nowMs();
   
-  // Notify all players that countdown started
   const msg = JSON.stringify({
     t: 'match_created',
     mode,
@@ -362,8 +376,7 @@ function updateQueueCountdowns() {
     const elapsed = now - queue.countdownStartedAt;
     const remaining = Math.max(0, QUEUE_COUNTDOWN_MS - elapsed);
     
-    // Send countdown updates periodically
-    if (elapsed % 1000 < TICK_DT * 1000) { // roughly once per second
+    if (elapsed % 1000 < TICK_DT * 1000) {
       const msg = JSON.stringify({
         t: 'match_countdown',
         mode,
@@ -378,7 +391,6 @@ function updateQueueCountdowns() {
       }
     }
     
-    // When countdown reaches zero, create match
     if (remaining <= 0 && queue.players.length >= MIN_PLAYERS_TO_START) {
       createMatchFromQueue(mode);
     }
@@ -402,7 +414,7 @@ function createMatchFromQueue(mode) {
     id: matchId,
     mode,
     players: matchPlayers,
-    state: 'loading', // 'loading' -> 'in_game' -> 'finished'
+    state: 'loading',
     createdAt: nowMs(),
     countdownStartedAt: null,
     startedAt: null,
@@ -411,10 +423,8 @@ function createMatchFromQueue(mode) {
   
   matches.set(matchId, match);
   
-  // Clear the queue
   queues.delete(mode);
   
-  // Notify all match players to start the game
   const msg = JSON.stringify({
     t: 'match_start',
     matchId,
@@ -430,14 +440,20 @@ function createMatchFromQueue(mode) {
   
   for (const p of matchPlayers.values()) {
     if (p.ws && p.ws.readyState === WebSocket.OPEN) {
-      // Reset player state for new match
       p.hp = p.maxHp;
       p.kills = 0;
       p.deaths = 0;
       p.xp = 0;
       p.level = 1;
       p.nextLevelXp = 100;
-      const pos = bottomLeftSpawn();
+      
+      // ✅ RANDOM SPAWN FOR FFA
+      let pos;
+      if (mode === 'ffa') {
+        pos = randomMapSpawn();
+      } else {
+        pos = bottomLeftSpawn();
+      }
       p.x = pos.x;
       p.y = pos.y;
       p.serverX = pos.x;
@@ -475,7 +491,6 @@ function createPlayerRuntime(ws, opts = {}) {
     _baseMaxHp: 200,
     _baseBaseSpeed: 380,
     _baseBaseDamage: 18,
-    // FFA match tracking
     kills: 0,
     deaths: 0,
     serverX: pos.x,
@@ -635,14 +650,13 @@ function handleMobDeath(mob, killerId = null) {
     if (matchId) {
       const match = matches.get(matchId);
       if (match) {
-        // Update leaderboard
         const entry = match.leaderboard.find(e => e.playerId === killer.id);
         if (entry) entry.kills++;
         broadcastToMatch(matchId, { t:'mob_died', mobId: mob.id, mobType: mob.type, killerId: killer.id, gold, xp, leaderboard: match.leaderboard });
       }
     }
   } else {
-    const matchId = Array.from(playerToMatch.values())[0]; // just pick first match for broadcast
+    const matchId = Array.from(playerToMatch.values())[0];
     if (matchId) {
       broadcastToMatch(matchId, { t:'mob_died', mobId: mob.id, mobType: mob.type, killerId: null, gold:0, xp:0 });
     }
@@ -681,6 +695,19 @@ function handlePlayerDeath(player, killer) {
       killerP.gold = Number(killerP.gold||0) + stolen;
       killerP.kills = (killerP.kills || 0) + 1;
     }
+    
+    // ✅ UPDATE LEADERBOARD ON PLAYER KILL
+    const matchId = playerToMatch.get(killerP.id);
+    if (matchId) {
+      const match = matches.get(matchId);
+      if (match && match.leaderboard) {
+        const leaderboardEntry = match.leaderboard.find(e => e.playerId === killerP.id);
+        if (leaderboardEntry) {
+          leaderboardEntry.kills++;
+          console.log(`✅ Updated leaderboard for ${killerP.name}: ${leaderboardEntry.kills} kills`);
+        }
+      }
+    }
   }
   player.hp = 0;
   player.deaths = (player.deaths || 0) + 1;
@@ -704,17 +731,14 @@ function resolveCircleAABB(p, rect) {
 function serverTick() {
   const now = nowMs();
   
-  // Update queue countdowns
   updateQueueCountdowns();
   
-  // respawn mobs
   for (const [id,m] of mobs.entries()) {
     if (m.hp <= 0 && m.respawnAt && now >= m.respawnAt) {
       mobs.delete(id); const sp = m.spawnPoint; spawnMobAt(sp, m.type);
     }
   }
 
-  // update mobs
   for (const m of mobs.values()) {
     if (m.hp <= 0) continue;
     if (m.stunnedUntil && now < m.stunnedUntil) {
@@ -737,7 +761,6 @@ function serverTick() {
     } else { m.vx *= 0.9; m.vy *= 0.9; m.x += m.vx * TICK_DT; m.y += m.vy * TICK_DT; }
   }
 
-  // update players
   for (const p of players.values()) {
     const nowMsVal = nowMs();
     p.buffs = (p.buffs || []).filter(b => b.until > nowMsVal);
@@ -811,7 +834,6 @@ function serverTick() {
     p.lastSeen = now;
   }
 
-  // projectiles update
   const toRemove = [];
   for (const [id,proj] of projectiles.entries()) {
     const dt = TICK_DT;
@@ -863,7 +885,6 @@ function serverTick() {
   }
   for (const id of toRemove) projectiles.delete(id);
 
-  // broadcast snapshots to all active matches
   for (const [matchId, match] of matches.entries()) {
     if (match.state !== 'in_game') continue;
     
@@ -877,7 +898,6 @@ function serverTick() {
 
 setInterval(serverTick, Math.round(1000 / TICK_RATE));
 
-// Periodic server-side healing
 const HEAL_INTERVAL_MS = 10000;
 setInterval(() => {
   const now = Date.now();
@@ -898,7 +918,6 @@ setInterval(() => {
   }
 }, HEAL_INTERVAL_MS);
 
-// heartbeat + cleanup
 const HEARTBEAT_INTERVAL_MS = 30000;
 const PLAYER_STALE_MS = 120000;
 
@@ -915,7 +934,6 @@ const heartbeatInterval = setInterval(() => {
 
   for (const [id, p] of players.entries()) {
     if (now - (p.lastSeen || 0) > PLAYER_STALE_MS) {
-      // Remove from queue or match
       removePlayerFromQueue(id);
       const matchId = playerToMatch.get(id);
       if (matchId) {
@@ -966,7 +984,6 @@ wss.on('connection', (ws, req) => {
             ws.playerId = p.id;
             
             try {
-              // Send welcome, but don't load them into a match yet - show mode select
               ws.send(JSON.stringify({ 
                 t:'welcome', 
                 id: p.id, 
@@ -989,7 +1006,6 @@ wss.on('connection', (ws, req) => {
         const player = players.get(String(ws.playerId));
         if (!player) return;
 
-        // --- MATCHMAKING MESSAGES ---
         if (msg.t === 'join_queue') {
           const mode = String(msg.mode || 'ffa');
           addPlayerToQueue(player, mode);
@@ -999,9 +1015,8 @@ wss.on('connection', (ws, req) => {
           return;
         }
         
-        // --- GAMEPLAY MESSAGES (only process if in a match) ---
         const matchId = playerToMatch.get(player.id);
-        if (!matchId) return; // Player not in match, ignore gameplay messages
+        if (!matchId) return;
 
         if (msg.t === 'input') {
           const input = msg.input;
