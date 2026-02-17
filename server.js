@@ -418,6 +418,7 @@ function createMatchFromQueue(mode) {
     createdAt: nowMs(),
     countdownStartedAt: null,
     startedAt: null,
+    timerAdjusted: false,
     leaderboard: Array.from(matchPlayers.values()).map(p => ({ playerId: p.id, playerName: p.name, kills: 0 }))
   };
   
@@ -727,11 +728,41 @@ function resolveCircleAABB(p, rect) {
   if (overlap > 0) { dx /= dist; dy /= dist; p.x += dx * overlap; p.y += dy * overlap; const vn = p.vx * dx + p.vy * dy; if (vn > 0) { p.vx -= vn * dx; p.vy -= vn * dy; } }
 }
 
+// ✅ NEW: Track match player count changes and adjust timer for FFA
+function updateMatchTimers() {
+  for (const [matchId, match] of matches.entries()) {
+    if (match.state !== 'in_game') continue;
+    if (match.mode !== 'ffa') continue;
+    
+    const alivePlayerCount = Array.from(match.players.values()).filter(p => p.hp > 0).length;
+    
+    // ✅ If <= 6 players left, reduce timer to 3 minutes
+    if (alivePlayerCount <= 6 && !match.timerAdjusted) {
+      match.timerAdjusted = true;
+      const now = nowMs();
+      match.startedAt = now;
+      match.matchTimeRemainingMs = 180000; // 3 minutes
+      console.log(`⏱️ Match ${matchId} reduced to 3 minutes (${alivePlayerCount} players alive)`);
+      
+      // Notify all players
+      try {
+        broadcastToMatch(matchId, {
+          t: 'timer_adjusted',
+          reason: 'players_left',
+          remainingMs: 180000,
+          playerCount: alivePlayerCount
+        });
+      } catch (e) {}
+    }
+  }
+}
+
 // --- Server tick ---
 function serverTick() {
   const now = nowMs();
   
   updateQueueCountdowns();
+  updateMatchTimers(); // ✅ NEW: Check for timer adjustments
   
   for (const [id,m] of mobs.entries()) {
     if (m.hp <= 0 && m.respawnAt && now >= m.respawnAt) {
