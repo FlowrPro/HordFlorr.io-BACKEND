@@ -26,7 +26,7 @@ const WALL_THICKNESS = 672;
 const SPAWN_MARGIN = 450;
 
 // --- MATCHMAKING CONSTANTS ---
-const QUEUE_COUNTDOWN_MS = 20000; // 20 seconds for testing (was 120000)
+const QUEUE_COUNTDOWN_MS = 20000; // 20 seconds for testing (normally 2 minutes)
 const MATCH_DURATION_MS = 1800000; // 30 minutes
 const MIN_PLAYERS_TO_START = 2; // minimum players needed to start match
 const MAX_PLAYERS_PER_MATCH = 10;
@@ -241,7 +241,7 @@ const SKILL_DEFS = {
     { kind: 'proj_target', damage: 40, speed: 680, radius: 6, ttlMs: 3000, type: 'arrow' },
     { kind: 'proj_burst', damage: 20, speed: 720, radius: 5, ttlMs: 2500, type: 'rapid', count: 5, spreadDeg: 12 },
     { kind: 'proj_target_stun', damage: 12, speed: 380, radius: 8, ttlMs: 1600, type: 'trap', stunMs: 3000 },
-    { kind: 'proj_target', damage: 120, speed: 880, radius: 7, ttlMs: 3500, type: 'snipe' }
+    { kind: 'proj_target', damage: 120, radius: 7, speed: 880, ttlMs: 3500, type: 'snipe' }
   ],
   mage: [
     { kind: 'proj_target', damage: 45, speed: 420, radius: 10, ttlMs: 3000, type: 'spark' },
@@ -376,6 +376,27 @@ function updateQueueCountdowns() {
     const elapsed = now - queue.countdownStartedAt;
     const remaining = Math.max(0, QUEUE_COUNTDOWN_MS - elapsed);
     
+    // ✅ CHECK PLAYER COUNT - if dropped below minimum, ABORT
+    if (queue.players.length < MIN_PLAYERS_TO_START) {
+      console.warn(`⚠️ Queue ${mode} dropped below ${MIN_PLAYERS_TO_START} players (now ${queue.players.length}), cancelling countdown`);
+      queue.countdownStartedAt = null;
+      
+      const msg = JSON.stringify({
+        t: 'queue_update',
+        mode,
+        players: queue.players.map(p => ({ id: p.id, name: p.name })),
+        count: queue.players.length,
+        reason: 'cancelled_insufficient_players'
+      });
+      
+      for (const p of queue.players) {
+        if (p.ws && p.ws.readyState === WebSocket.OPEN) {
+          try { p.ws.send(msg); } catch (e) {}
+        }
+      }
+      continue; // ✅ IMPORTANT: Don't send countdown updates and don't create match
+    }
+    
     if (elapsed % 1000 < TICK_DT * 1000) {
       const msg = JSON.stringify({
         t: 'match_countdown',
@@ -391,8 +412,28 @@ function updateQueueCountdowns() {
       }
     }
     
+    // ✅ ONLY create match if we have enough players AND countdown ended
     if (remaining <= 0 && queue.players.length >= MIN_PLAYERS_TO_START) {
+      console.log(`✅ Countdown ended with ${queue.players.length} players - creating match`);
       createMatchFromQueue(mode);
+    } else if (remaining <= 0) {
+      // ✅ Time ran out but insufficient players
+      console.warn(`❌ Countdown ended with only ${queue.players.length} players (need ${MIN_PLAYERS_TO_START}) - match cancelled`);
+      queue.countdownStartedAt = null;
+      
+      const msg = JSON.stringify({
+        t: 'match_countdown',
+        mode,
+        remainingMs: 0,
+        players: queue.players.map(p => ({ id: p.id, name: p.name })),
+        reason: 'countdown_ended_insufficient_players'
+      });
+      
+      for (const p of queue.players) {
+        if (p.ws && p.ws.readyState === WebSocket.OPEN) {
+          try { p.ws.send(msg); } catch (e) {}
+        }
+      }
     }
   }
 }
@@ -468,49 +509,6 @@ function createMatchFromQueue(mode) {
   
   match.startedAt = nowMs();
   match.state = 'in_game';
-}
-
-function checkMatchEndConditions() {
-  const now = nowMs();
-  
-  for (const [matchId, match] of matches.entries()) {
-    if (match.state !== 'in_game') continue;
-    
-    const elapsed = now - (match.startedAt || 0);
-    const remaining = MATCH_DURATION_MS - elapsed;
-    
-    // Check if match time ended
-    if (remaining <= 0) {
-      console.log(`🏁 Match ${matchId} time expired - ending match`);
-      endMatch(matchId, 'time_expired');
-    }
-  }
-}
-
-function endMatch(matchId, reason) {
-  const match = matches.get(matchId);
-  if (!match) return;
-  
-  match.state = 'ended';
-  
-  // Sort leaderboard by kills
-  const sorted = (match.leaderboard || []).sort((a, b) => (b.kills || 0) - (a.kills || 0));
-  
-  const msg = JSON.stringify({
-    t: 'match_end',
-    matchId,
-    reason,
-    leaderboard: sorted,
-    winner: sorted.length > 0 ? sorted[0].playerName : null
-  });
-  
-  for (const p of match.players.values()) {
-    if (p.ws && p.ws.readyState === WebSocket.OPEN) {
-      try { p.ws.send(msg); } catch (e) {}
-    }
-  }
-  
-  console.log(`✓ Match ${matchId} ended - winner: ${sorted.length > 0 ? sorted[0].playerName : 'N/A'}`);
 }
 
 function createPlayerRuntime(ws, opts = {}) {
@@ -771,12 +769,45 @@ function resolveCircleAABB(p, rect) {
   if (overlap > 0) { dx /= dist; dy /= dist; p.x += dx * overlap; p.y += dy * overlap; const vn = p.vx * dx + p.vy * dy; if (vn > 0) { p.vx -= vn * dx; p.vy -= vn * dy; } }
 }
 
+// ✅ Check for match timer end
+function updateMatchTimers() {
+  for (const [matchId, match] of matches.entries()) {
+    if (match.state !== 'in_game') continue;
+    
+    const now = nowMs();
+    const elapsed = now - match.startedAt;
+    const remaining = MATCH_DURATION_MS - elapsed;
+    
+    if (remaining <= 0) {
+      console.log(`🏁 Match ${matchId} timer expired - match ended`);
+      match.state = 'ended';
+      
+      // Sort leaderboard by kills (descending)
+      const sortedLeaderboard = [...match.leaderboard].sort((a, b) => b.kills - a.kills);
+      
+      const msg = JSON.stringify({
+        t: 'match_ended',
+        matchId,
+        leaderboard: sortedLeaderboard,
+        endTime: now
+      });
+      
+      broadcastToMatch(matchId, msg);
+      
+      // Clean up match from tracking
+      setTimeout(() => {
+        matches.delete(matchId);
+      }, 60000); // Keep in memory for 1 minute
+    }
+  }
+}
+
 // --- Server tick ---
 function serverTick() {
   const now = nowMs();
   
   updateQueueCountdowns();
-  checkMatchEndConditions();
+  updateMatchTimers(); // ✅ Check for match end
   
   for (const [id,m] of mobs.entries()) {
     if (m.hp <= 0 && m.respawnAt && now >= m.respawnAt) {
@@ -1271,15 +1302,4 @@ wss.on('connection', (ws, req) => {
 });
 
 function shutdown() {
-  console.log('Shutting down...');
-  try { clearInterval(heartbeatInterval); } catch(e){}
-  try { wss.close(() => {}); } catch(e){}
-  try { server.close(() => { process.exit(0); }); } catch(e) { process.exit(0); }
-  setTimeout(() => process.exit(0), 5000);
-}
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
-process.on('uncaughtException', (err) => console.error('Uncaught exception:', err));
-process.on('unhandledRejection', (reason, p) => console.error('Unhandled rejection at:', p, 'reason:', reason));
-
-server.listen(PORT, () => { console.log(`Moborr server listening on port ${PORT}`); });
+  console.log('
