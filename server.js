@@ -28,7 +28,7 @@ const SPAWN_MARGIN = 450;
 // --- MATCHMAKING CONSTANTS ---
 const QUEUE_COUNTDOWN_MS = 20000; // 20 seconds for testing (normally 2 minutes)
 const MATCH_DURATION_MS = 1800000; // 30 minutes
-const MIN_PLAYERS_TO_START = 2; // minimum players needed to start match
+const MIN_PLAYERS_TO_START = 4; // minimum players needed to start match
 const MAX_PLAYERS_PER_MATCH = 10;
 
 // --- Global state ---
