@@ -394,7 +394,7 @@ function updateQueueCountdowns() {
           try { p.ws.send(msg); } catch (e) {}
         }
       }
-      continue; // ✅ IMPORTANT: Don't send countdown updates and don't create match
+      continue;
     }
     
     if (elapsed % 1000 < TICK_DT * 1000) {
@@ -738,7 +738,6 @@ function handlePlayerDeath(player, killer) {
       killerP.kills = (killerP.kills || 0) + 1;
     }
     
-    // ✅ UPDATE LEADERBOARD ON PLAYER KILL
     const matchId = playerToMatch.get(killerP.id);
     if (matchId) {
       const match = matches.get(matchId);
@@ -769,7 +768,6 @@ function resolveCircleAABB(p, rect) {
   if (overlap > 0) { dx /= dist; dy /= dist; p.x += dx * overlap; p.y += dy * overlap; const vn = p.vx * dx + p.vy * dy; if (vn > 0) { p.vx -= vn * dx; p.vy -= vn * dy; } }
 }
 
-// ✅ Check for match timer end
 function updateMatchTimers() {
   for (const [matchId, match] of matches.entries()) {
     if (match.state !== 'in_game') continue;
@@ -797,7 +795,7 @@ function updateMatchTimers() {
       // Clean up match from tracking
       setTimeout(() => {
         matches.delete(matchId);
-      }, 60000); // Keep in memory for 1 minute
+      }, 60000);
     }
   }
 }
@@ -807,7 +805,7 @@ function serverTick() {
   const now = nowMs();
   
   updateQueueCountdowns();
-  updateMatchTimers(); // ✅ Check for match end
+  updateMatchTimers();
   
   for (const [id,m] of mobs.entries()) {
     if (m.hp <= 0 && m.respawnAt && now >= m.respawnAt) {
@@ -1302,4 +1300,16 @@ wss.on('connection', (ws, req) => {
 });
 
 function shutdown() {
-  console.log('
+  console.log('Shutting down...');
+  try { clearInterval(heartbeatInterval); } catch(e){}
+  try { wss.close(() => {}); } catch(e){}
+  try { server.close(() => { process.exit(0); }); } catch(e) { process.exit(0); }
+  setTimeout(() => process.exit(0), 5000);
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+process.on('uncaughtException', (err) => console.error('Uncaught exception:', err));
+process.on('unhandledRejection', (reason, p) => console.error('Unhandled rejection at:', p, 'reason:', reason));
+
+server.listen(PORT, () => { console.log(`Moborr server listening on port ${PORT}`); });
