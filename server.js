@@ -26,7 +26,7 @@ const WALL_THICKNESS = 672;
 const SPAWN_MARGIN = 450;
 
 // --- MATCHMAKING CONSTANTS ---
-const QUEUE_COUNTDOWN_MS = 120000; // 2 minutes before match starts
+const QUEUE_COUNTDOWN_MS = 20000; // 20 seconds for testing (was 120000)
 const MATCH_DURATION_MS = 1800000; // 30 minutes
 const MIN_PLAYERS_TO_START = 2; // minimum players needed to start match
 const MAX_PLAYERS_PER_MATCH = 10;
@@ -470,6 +470,49 @@ function createMatchFromQueue(mode) {
   match.state = 'in_game';
 }
 
+function checkMatchEndConditions() {
+  const now = nowMs();
+  
+  for (const [matchId, match] of matches.entries()) {
+    if (match.state !== 'in_game') continue;
+    
+    const elapsed = now - (match.startedAt || 0);
+    const remaining = MATCH_DURATION_MS - elapsed;
+    
+    // Check if match time ended
+    if (remaining <= 0) {
+      console.log(`🏁 Match ${matchId} time expired - ending match`);
+      endMatch(matchId, 'time_expired');
+    }
+  }
+}
+
+function endMatch(matchId, reason) {
+  const match = matches.get(matchId);
+  if (!match) return;
+  
+  match.state = 'ended';
+  
+  // Sort leaderboard by kills
+  const sorted = (match.leaderboard || []).sort((a, b) => (b.kills || 0) - (a.kills || 0));
+  
+  const msg = JSON.stringify({
+    t: 'match_end',
+    matchId,
+    reason,
+    leaderboard: sorted,
+    winner: sorted.length > 0 ? sorted[0].playerName : null
+  });
+  
+  for (const p of match.players.values()) {
+    if (p.ws && p.ws.readyState === WebSocket.OPEN) {
+      try { p.ws.send(msg); } catch (e) {}
+    }
+  }
+  
+  console.log(`✓ Match ${matchId} ended - winner: ${sorted.length > 0 ? sorted[0].playerName : 'N/A'}`);
+}
+
 function createPlayerRuntime(ws, opts = {}) {
   const fixedId = opts.id || null;
   const id = fixedId ? String(fixedId) : String(nextPlayerId++);
@@ -728,41 +771,12 @@ function resolveCircleAABB(p, rect) {
   if (overlap > 0) { dx /= dist; dy /= dist; p.x += dx * overlap; p.y += dy * overlap; const vn = p.vx * dx + p.vy * dy; if (vn > 0) { p.vx -= vn * dx; p.vy -= vn * dy; } }
 }
 
-// ✅ NEW: Track match player count changes and adjust timer for FFA
-function updateMatchTimers() {
-  for (const [matchId, match] of matches.entries()) {
-    if (match.state !== 'in_game') continue;
-    if (match.mode !== 'ffa') continue;
-    
-    const alivePlayerCount = Array.from(match.players.values()).filter(p => p.hp > 0).length;
-    
-    // ✅ If <= 6 players left, reduce timer to 3 minutes
-    if (alivePlayerCount <= 6 && !match.timerAdjusted) {
-      match.timerAdjusted = true;
-      const now = nowMs();
-      match.startedAt = now;
-      match.matchTimeRemainingMs = 180000; // 3 minutes
-      console.log(`⏱️ Match ${matchId} reduced to 3 minutes (${alivePlayerCount} players alive)`);
-      
-      // Notify all players
-      try {
-        broadcastToMatch(matchId, {
-          t: 'timer_adjusted',
-          reason: 'players_left',
-          remainingMs: 180000,
-          playerCount: alivePlayerCount
-        });
-      } catch (e) {}
-    }
-  }
-}
-
 // --- Server tick ---
 function serverTick() {
   const now = nowMs();
   
   updateQueueCountdowns();
-  updateMatchTimers(); // ✅ NEW: Check for timer adjustments
+  checkMatchEndConditions();
   
   for (const [id,m] of mobs.entries()) {
     if (m.hp <= 0 && m.respawnAt && now >= m.respawnAt) {
